@@ -1,0 +1,10 @@
+# Reports contain tenant, environment, agent and user identifiers - never commit them.
+reports/
+*.csv
+
+# Keep the sample exclusion files.
+!samples/*.csv
+
+# Local scratch
+*.log
+.vscode/
