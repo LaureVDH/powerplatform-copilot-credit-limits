@@ -170,6 +170,15 @@ Two API details worth knowing, both confirmed against a live tenant:
 - Date parameters are **camelCase** on the REST API (`fromDate` / `toDate`). The kebab-case spelling
   is the `pac` CLI flag name and is rejected with HTTP 400.
 
+### Troubleshooting
+
+**`Target environments: 0` with `-EnvironmentGroup`**
+
+Run again with `-Verbose`. The output shows which endpoint answered, and if no environment matched the
+group, the script prints the group values every environment actually reported so you can see whether
+the group is empty or whether membership is exposed on a field it doesn't read. Targeting the
+environments directly with `-Environment` always works as a fallback.
+
 ---
 
 ## How agents are discovered

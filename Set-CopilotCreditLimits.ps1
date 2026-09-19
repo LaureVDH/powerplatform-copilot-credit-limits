@@ -1014,7 +1014,10 @@ function Resolve-TargetEnvironments
     [CmdletBinding()]
     param()
 
-    if ($PSCmdlet.ParameterSetName -eq 'Group')
+    # NOTE: $PSCmdlet inside a function refers to THAT function, not to the script, so
+    # $PSCmdlet.ParameterSetName here would return '__AllParameterSets' and never 'Group'.
+    # The bound script parameter is the reliable signal.
+    if ($EnvironmentGroup)
     {
         $group = Resolve-EnvironmentGroup -GroupIdOrName $EnvironmentGroup
         $groupId = "$(Get-PropertyValue -InputObject $group -Paths @('id', 'name', 'groupId'))"
@@ -1060,7 +1063,28 @@ function Resolve-TargetEnvironments
 
         if ($environments.Count -eq 0)
         {
-            throw "No environments were found in environment group '$groupName'."
+            # Group membership is exposed inconsistently across API surfaces, so show what the
+            # environments actually reported rather than just failing.
+            Write-Warning "No environments matched group '$groupName' ($groupId)."
+
+            $observed = Get-AllEnvironments |
+                Select-Object @{ Name = 'Environment'; Expression = { Get-EnvironmentDisplayName -EnvironmentObject $_ } },
+                              @{ Name = 'GroupValueSeen'; Expression = { Get-EnvironmentGroupValue -EnvironmentObject $_ } } |
+                Where-Object { $_.GroupValueSeen }
+
+            if ($observed)
+            {
+                Write-Host 'Group values reported by environments in this tenant:' -ForegroundColor Yellow
+                $observed | Format-Table -AutoSize | Out-Host
+            }
+            else
+            {
+                Write-Host 'No environment reported any group membership field.' -ForegroundColor Yellow
+                Write-Host 'The group may be empty, or membership is not exposed on this API surface.' -ForegroundColor Yellow
+            }
+
+            throw ("No environments were found in environment group '$groupName'. " +
+                   'Confirm the group contains environments, or target them with -Environment instead.')
         }
 
         # Group endpoints can return reduced objects; re-hydrate from the full environment list so the
@@ -2127,6 +2151,12 @@ try
     $userExclusions = Get-ExclusionSet -InlineValues $ExcludeUserId -CsvPath $ExcludeUserIdCsv -ColumnCandidates @('UserId', 'ObjectId', 'Upn', 'Email', 'Id') -Label 'user'
 
     $environments = @(Resolve-TargetEnvironments)
+
+    if ($environments.Count -eq 0)
+    {
+        throw 'No target environments were resolved. Rerun with -Verbose to see which lookups were attempted.'
+    }
+
     Write-Host "Target environments: $($environments.Count)" -ForegroundColor Green
 
     if ($Diagnostics)
