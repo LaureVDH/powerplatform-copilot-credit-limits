@@ -7,8 +7,24 @@ what was changed.
 Companion to [`powerplatform-tenant-pool-draw`](https://github.com/LaureVDH/powerplatform-tenant-pool-draw):
 same design (interactive `Az.Accounts` sign-in, Power Platform API, `-WhatIf`, tolerant property resolution).
 
-> **Status:** tested end to end against a live tenant (19 environments, 18 agents).
-> Write → read-back verified: limits applied through the API are returned by a subsequent read.
+> **Status:** tested end to end against a live tenant and **verified in the Power Platform admin
+> center** — a limit written by this script appears under Licensing > Copilot Studio > Manage Agents
+> with a *Within Limit* status, which is the enforcement surface, not just the underlying table.
+
+> ### Important: the threshold route needs `api-version=1`
+>
+> The published licensing spec documents `api-version=2024-10-01`. The admin center calls the same
+> route with **`api-version=1`**, and that difference matters:
+>
+> | Version | Result |
+> | --- | --- |
+> | `2024-10-01` | `200 OK`, row persists in `resourceThresholds` — but **the limit never appears in Manage Agents** |
+> | `1` | `200 OK`, and the limit appears in Manage Agents and enforces |
+>
+> The `2024-10-01` endpoint also accepts a **random GUID that belongs to no resource** and stores it,
+> so success there proves nothing. Anyone automating this from the published spec will write limits
+> that silently do not enforce. This script uses `api-version=1` first and falls back to the
+> documented version.
 
 ---
 
@@ -157,7 +173,10 @@ Tested against a live tenant on 19 September 2026:
 
 Two API details worth knowing, both confirmed against a live tenant:
 
-- `notificationThreshold` is a **percentage (1-100)**, not a credit count.
+- The threshold route must be called with **`api-version=1`** (see the note at the top). The
+  documented `2024-10-01` accepts the write and persists it, but the limit never reaches the
+  enforcement surface.
+- `notificationThreshold` is a **percentage**, and the admin center restricts it to **50-100**.
 - `licensing/entitlements/{id}/resourceThresholds` is **tenant-wide** — records must be matched on
   `environmentId` *and* `resourceId`. Matching on `resourceId` alone lets a threshold from one
   environment be mistaken for another environment's.
