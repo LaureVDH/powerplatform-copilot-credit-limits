@@ -185,10 +185,32 @@ environments directly with `-Environment` always works as a fallback.
 
 | Source | Gives you | Caveat |
 | --- | --- | --- |
-| **Licensing** (`licensing/entitlements/MCSMessages/environments/{envId}/resources`) | Resource IDs that are guaranteed valid for the threshold API, plus month-to-date consumption. | Only agents that have consumed credits appear. |
-| **Dataverse** (`bots` table) | Every agent in the environment, with display names. | Needs Dataverse access to each environment. |
+| **Licensing** (`licensing/entitlements/MCSMessages/environments/{envId}/resources`) | Resource IDs that are guaranteed valid for the threshold API, plus month-to-date consumption. | Only agents that have consumed credits appear. Can return 403 (see quirks). |
+| **Dataverse** (`bots` table) | Every agent in the environment, with display names. | **Requires you to be a member of that environment's Dataverse instance.** |
 
 `-AgentSource Both` (default) merges the two, so you get names *and* coverage of never-used agents.
+
+### Environments you cannot inspect
+
+Being a **Power Platform administrator is not sufficient** to read an environment's `bots` table. You
+must be a member (System Administrator) of the Dataverse instance itself. This commonly affects
+**personal developer environments**, which are exactly the ones that tend to consume credits
+unintentionally.
+
+The script never treats an inaccessible environment as empty. It reports:
+
+| Action | Meaning |
+| --- | --- |
+| `NoAgentsFound` | The environment was inspected and genuinely contains no agents. |
+| `NotInspected` | The environment **could not be read**. Its agents are **unknown**, and no limit was applied. |
+
+Every run ends with an **INCOMPLETE COVERAGE** section listing the environments that could not be
+fully inspected and why. Do not read such a run as confirming those environments are clean.
+
+To include them, add yourself as a System Administrator in each environment and rerun. **For
+environments you cannot access, the effective control is the environment-group rule that disables
+drawing from the tenant pool, combined with a zero credit allocation** — that constrains an
+environment without needing visibility into its contents.
 
 ---
 
@@ -200,7 +222,11 @@ Every run writes `reports\CopilotCreditLimits-yyyyMMdd-HHmmss.csv` and prints a 
 PreviousLimit, NewLimit, NotificationThresholdPct, StopIfOverCapacity, Consumed, Message`
 
 `Action` values: `Set`, `Skipped-Excluded`, `Skipped-NoChange`, `WhatIf`, `ReportOnly`,
-`NoAgentsFound`, `Failed`.
+`NoAgentsFound`, `NotInspected`, `Failed`.
+
+> `NoAgentsFound` and `NotInspected` mean different things. The first is a confirmed empty
+> environment; the second is an environment that could not be read at all. Treat `NotInspected` rows
+> as gaps in coverage, not as clean results.
 
 ---
 

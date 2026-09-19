@@ -1197,6 +1197,11 @@ function Get-LicensingAgents
 
 function Get-DataverseAgents
 {
+    <#
+        Returns a result object rather than a bare list, because "this environment has no agents" and
+        "this environment could not be inspected" must not look the same to the caller. Reporting an
+        inaccessible environment as empty would understate the estate in a governance report.
+    #>
     [CmdletBinding()]
     param
     (
@@ -1208,12 +1213,41 @@ function Get-DataverseAgents
 
     try
     {
-        return @(Invoke-DataverseApi -InstanceApiUrl $InstanceApiUrl -Path $query)
+        $bots = @(Invoke-DataverseApi -InstanceApiUrl $InstanceApiUrl -Path $query)
+
+        return [PSCustomObject]@{
+            Succeeded = $true
+            Agents    = $bots
+            Error     = $null
+        }
     }
     catch
     {
-        Write-Warning "Could not read the Dataverse 'bots' table at $InstanceApiUrl. $($_.Exception.Message)"
-        return @()
+        $statusCode = $null
+
+        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
+        {
+            $statusCode = [int] $_.Exception.Response.StatusCode
+        }
+
+        $reason = if ($statusCode -eq 403)
+        {
+            "access denied (HTTP 403) - you are not a member of this environment's Dataverse instance"
+        }
+        elseif ($statusCode -eq 404)
+        {
+            'no Dataverse instance found (HTTP 404)'
+        }
+        else
+        {
+            $_.Exception.Message
+        }
+
+        return [PSCustomObject]@{
+            Succeeded = $false
+            Agents    = @()
+            Error     = $reason
+        }
     }
 }
 
@@ -1360,15 +1394,29 @@ function Invoke-AgentScope
             }
         }
 
+        $discoveryFailed = $false
+        $discoveryError = $null
+
         if ($AgentSource -eq 'Dataverse' -or $AgentSource -eq 'Both')
         {
             if (-not $instanceUrl)
             {
-                Write-Warning "No Dataverse instance URL was found for '$environmentName'; skipping Dataverse agent discovery."
+                $discoveryFailed = $true
+                $discoveryError = 'no Dataverse instance URL was found for this environment'
+                Write-Warning "No Dataverse instance URL was found for '$environmentName'; agents cannot be enumerated."
             }
             else
             {
-                foreach ($bot in Get-DataverseAgents -InstanceApiUrl $instanceUrl)
+                $dataverseResult = Get-DataverseAgents -InstanceApiUrl $instanceUrl
+
+                if (-not $dataverseResult.Succeeded)
+                {
+                    $discoveryFailed = $true
+                    $discoveryError = $dataverseResult.Error
+                    Write-Host ("  [WARN]  Agents could not be enumerated in '{0}': {1}" -f $environmentName, $dataverseResult.Error) -ForegroundColor Red
+                }
+
+                foreach ($bot in $dataverseResult.Agents)
                 {
                     $botId = "$($bot.botid)"
 
@@ -1397,7 +1445,23 @@ function Invoke-AgentScope
 
         if ($agents.Count -eq 0)
         {
-            Write-Host 'No agents were found in this environment.' -ForegroundColor Yellow
+            if ($discoveryFailed)
+            {
+                $script:NotInspectedEnvironments.Add([PSCustomObject]@{
+                    EnvironmentName = $environmentName
+                    EnvironmentId   = $environmentId
+                    Reason          = $discoveryError
+                }) | Out-Null
+
+                $action = 'NotInspected'
+                $message = "Agents could NOT be enumerated ($discoveryError). This environment's agents are UNKNOWN - it is not confirmed to be empty."
+            }
+            else
+            {
+                Write-Host 'No agents were found in this environment.' -ForegroundColor Yellow
+                $action = 'NoAgentsFound'
+                $message = 'No agents exist in this environment.'
+            }
 
             $Report.Add([PSCustomObject]@{
                 Timestamp             = (Get-Date).ToString('s')
@@ -1407,16 +1471,27 @@ function Invoke-AgentScope
                 TargetId              = ''
                 TargetName            = ''
                 Source                = ''
-                Action                = 'NoAgentsFound'
+                Action                = $action
                 PreviousLimit         = ''
                 NewLimit              = ''
                 NotificationThresholdPct = ''
                 StopIfOverCapacity    = ''
                 Consumed              = ''
-                Message               = 'No agents discovered in this environment.'
+                Message               = $message
             }) | Out-Null
 
             continue
+        }
+
+        if ($discoveryFailed)
+        {
+            # Partial visibility: licensing returned some agents but Dataverse could not be read, so
+            # the list may be incomplete.
+            $script:NotInspectedEnvironments.Add([PSCustomObject]@{
+                EnvironmentName = $environmentName
+                EnvironmentId   = $environmentId
+                Reason          = "$discoveryError (partial list: $($agents.Count) agent(s) found from licensing only)"
+            }) | Out-Null
         }
 
         Write-Host "Agents discovered: $($agents.Count)" -ForegroundColor Green
@@ -2118,9 +2193,18 @@ function Invoke-Discover
     if ($instanceUrl)
     {
         Write-Section 'Dataverse bots (all agents)'
-        $bots = @(Get-DataverseAgents -InstanceApiUrl $instanceUrl)
-        Write-Host "Agents: $($bots.Count)"
-        $bots | Select-Object -First 10 -Property botid, name, schemaname, statecode | Format-Table -AutoSize | Out-Host
+        $dataverseResult = Get-DataverseAgents -InstanceApiUrl $instanceUrl
+
+        if ($dataverseResult.Succeeded)
+        {
+            $bots = @($dataverseResult.Agents)
+            Write-Host "Agents: $($bots.Count)"
+            $bots | Select-Object -First 10 -Property botid, name, schemaname, statecode | Format-Table -AutoSize | Out-Host
+        }
+        else
+        {
+            Write-Host "Agents could NOT be enumerated: $($dataverseResult.Error)" -ForegroundColor Red
+        }
     }
 
     Write-Section 'Tenant user consumption (read-only)'
@@ -2202,6 +2286,7 @@ try
     }
 
     $report = New-Object System.Collections.Generic.List[object]
+    $script:NotInspectedEnvironments = New-Object System.Collections.Generic.List[object]
 
     if ($agentScopeRequested)
     {
@@ -2225,6 +2310,29 @@ try
         Group-Object Scope, Action |
         Sort-Object Name |
         ForEach-Object { Write-Host ("  {0,-45} {1}" -f $_.Name, $_.Count) }
+
+    if ($script:NotInspectedEnvironments.Count -gt 0)
+    {
+        Write-Host ''
+        Write-Host 'INCOMPLETE COVERAGE' -ForegroundColor Red
+        Write-Host '-------------------' -ForegroundColor Red
+        Write-Host ("{0} environment(s) could not be fully inspected. Their agents are UNKNOWN," -f $script:NotInspectedEnvironments.Count) -ForegroundColor Red
+        Write-Host 'and no limit was applied to them. Do not read this run as confirming they are clean.' -ForegroundColor Red
+        Write-Host ''
+
+        $script:NotInspectedEnvironments |
+            Select-Object EnvironmentName, EnvironmentId, Reason |
+            Format-Table -AutoSize |
+            Out-Host
+
+        Write-Host 'Agent discovery reads the Dataverse bots table, which requires you to be a member of' -ForegroundColor Yellow
+        Write-Host 'each environment. Being a Power Platform administrator is not sufficient on its own -' -ForegroundColor Yellow
+        Write-Host 'this commonly affects personal developer environments. To include them, add yourself as' -ForegroundColor Yellow
+        Write-Host 'a System Administrator in each environment, then rerun.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host 'For environments you cannot access, the effective control is the environment-group rule' -ForegroundColor Yellow
+        Write-Host 'that disables drawing from the tenant pool, combined with a zero credit allocation.' -ForegroundColor Yellow
+    }
 
     if (-not (Test-Path -LiteralPath $ReportPath))
     {
