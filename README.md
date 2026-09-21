@@ -1,119 +1,95 @@
 # powerplatform-copilot-credit-limits
 
-Automate **Copilot Credit limits** across Microsoft Copilot Studio / Power Platform — for every **agent**
-in an environment or in every environment of an **environment group** — and get a CSV report of exactly
-what was changed.
+Apply **Copilot Credit limits to Copilot Studio agents** across a single Power Platform environment,
+a list of environments, or every environment in an **environment group** — with exclusions, a dry-run
+mode, and a CSV report of exactly what changed.
 
-Companion to [`powerplatform-tenant-pool-draw`](https://github.com/LaureVDH/powerplatform-tenant-pool-draw):
-same design (interactive `Az.Accounts` sign-in, Power Platform API, `-WhatIf`, tolerant property resolution).
+Companion to [`powerplatform-tenant-pool-draw`](https://github.com/LaureVDH/powerplatform-tenant-pool-draw).
 
-> **Status:** tested end to end against a live tenant and **verified in the Power Platform admin
-> center** — a limit written by this script appears under Licensing > Copilot Studio > Manage Agents
-> with a *Within Limit* status, which is the enforcement surface, not just the underlying table.
+> **Verified.** Tested end to end against a live tenant, and confirmed in the Power Platform admin
+> center: a limit written by this script appears under **Licensing → Copilot Studio → Manage Agents**
+> with a *Within Limit* status. That is the enforcement surface, not just the underlying table.
 
-> ### Important: the threshold route needs `api-version=1`
->
-> The published licensing spec documents `api-version=2024-10-01`. The admin center calls the same
-> route with **`api-version=1`**, and that difference matters:
->
-> | Version | Result |
-> | --- | --- |
-> | `2024-10-01` | `200 OK`, row persists in `resourceThresholds` — but **the limit never appears in Manage Agents** |
-> | `1` | `200 OK`, and the limit appears in Manage Agents and enforces |
->
-> The `2024-10-01` endpoint also accepts a **random GUID that belongs to no resource** and stores it,
-> so success there proves nothing. Anyone automating this from the published spec will write limits
-> that silently do not enforce. This script uses `api-version=1` first and falls back to the
-> documented version.
+---
+
+## ⚠️ The API version trap
+
+If you are writing your own automation against this API, this will save you a day.
+
+The published licensing spec documents `api-version=2024-10-01`. The admin center calls the same
+route with **`api-version=1`**. They do not behave the same:
+
+| Version | Result |
+| --- | --- |
+| `2024-10-01` | `200 OK`, the row persists in `resourceThresholds` — but the limit **never appears in Manage Agents and does not enforce** |
+| `1` | `200 OK`, and the limit appears in Manage Agents and enforces |
+
+Worse, the endpoint **validates nothing**. It will accept a random GUID that belongs to no agent, and
+store it. `DELETE` is not supported, so a bad row cannot be removed through the API.
+
+**A `200` response is not evidence that anything was configured. Verify in the admin center.**
+
+This script uses `api-version=1` and falls back to the documented version.
 
 ---
 
 ## What it does
 
-| Scope | What happens | API |
-| --- | --- | --- |
-| **Agents** | Lists every agent in the target environment(s), then writes a per-agent monthly Copilot Credit limit, notification threshold and optional hard stop. | `PUT licensing/environments/{envId}/entitlements/MCSMessages/resources/{resourceId}/threshold` |
-| **Users** | Lists every maker/user of the target environment(s), annotates Entra group membership and credit consumption, and reports. **Read-only — see below.** | `GET licensing/entitlements/MCSMessages/users`, Dataverse `systemusers` |
-
-### Why users are report-only
-
-There are **two separate Copilot Credit limit systems**, and only one of them is programmable.
-
-**1. Copilot Studio / Power Platform credits (`MCSMessages`)** — what this script writes.
-Limits here apply to **agents only**. Verified against the published Power Platform OpenAPI specs
-(`licensing`, `copilotstudio`, `usermanagement`, `governance`, `environmentmanagement`): every `/users`
-endpoint is `GET`, and the only threshold `PUT` in the whole licensing namespace is the per-resource one.
-Microsoft's own guidance says the same — *"limits apply to agents rather than users."*
-
-**2. Microsoft 365 Cost Management spending policies** — where **per-user monthly caps do exist**.
-These are **hard limits**: the service stops for that user when the cap is reached.
-
-| Aspect | Detail |
+| Scope | Behaviour |
 | --- | --- |
-| Where | M365 admin center → **Copilot → Cost Management → Spending policies** |
-| Scoping | **Entra group** or tenant. Scoping a policy to a single user is *not yet supported*. |
-| Pattern | **Entra group → spending policy → per-user monthly limit** |
-| Minimum | 2,000 credits/user/month (7,000 recommended) |
-| Enforcement | Hard stop, reconciled periodically — a user can briefly exceed the cap; that overage isn't billed |
-| API | **None public today** — admin-center UI only |
+| **Agents** | Discovered across the target environments, then written with a monthly credit limit, a notification threshold, and an optional hard stop. |
+| **Flows** | Agent flows and cloud flows consume credits, so they are **inventoried and reported**. They are **not written to by default** — see [Flows](#flows). |
 
-> The older PAYG billing-policy "budget" (Copilot Chat / SharePoint agents) only sends **alerts**.
-> It does **not** stop consumption. Don't confuse the two.
+### Agent discovery
 
-So this script's user pass produces the **group-scoped inventory** you need to build those spending
-policies, and `-ProbeUserThresholdApi` tests whether a user-threshold endpoint has appeared in your
-tenant — at which point adding the write is a small change.
+Three sources, merged:
+
+| Source | Gives you | Caveat |
+| --- | --- | --- |
+| **Inventory** (`resourcequery`) | Every agent and flow, tenant-wide, in one call. **Admin-scoped.** | — |
+| **Licensing** | Month-to-date consumption. | Only agents that have consumed credits. Can return 403. |
+| **Dataverse** (`bots`) | Display names. | **Requires environment membership** — see below. |
+
+**Why Inventory matters.** Being a Power Platform administrator does **not** grant access to the
+Dataverse inside someone else's environment — the Copilot Studio portal fails there too. Personal
+developer environments therefore return **HTTP 403** to a `bots` query. The inventory API is
+control-plane and admin-scoped, so it sees into them anyway. Without it, PDEs are invisible — and
+they are exactly the environments that tend to consume credits unintentionally.
 
 ---
 
 ## Prerequisites
 
 - Windows PowerShell 5.1 or PowerShell 7
-- `Az.Accounts` module — `Install-Module Az.Accounts -Scope CurrentUser`
+- `Az.Accounts` — `Install-Module Az.Accounts -Scope CurrentUser`
 - Power Platform Administrator or Global Administrator
-- Optional fallback for environment listing: `Install-Module Microsoft.PowerApps.Administration.PowerShell -Scope CurrentUser`
-- Optional, for `-UserGroup`: Entra permission to read groups (Graph `Group.Read.All` / `Directory.Read.All`)
 
 ---
 
-## Quick start (recommended order)
+## Quick start
+
+Run these in order. The first two change nothing.
 
 ```powershell
-# 1. Read-only discovery - verifies auth and dumps the raw API shapes for one environment
-.\Set-CopilotCreditLimits.ps1 -Environment "Contoso Dev" -Discover
-
-# 2. Inventory current limits, no writes
+# 1. Inventory the agents and show their current limits. Read-only.
 .\Set-CopilotCreditLimits.ps1 -Environment "Contoso Dev" -ReportOnly
 
-# 3. Dry run - shows every agent that would be changed
+# 2. Dry run - shows exactly which agents would be changed.
 .\Set-CopilotCreditLimits.ps1 -Environment "Contoso Dev" -AgentCreditLimit 1000 -WhatIf
 
-# 4. Apply to one environment
+# 3. Apply to one environment.
 .\Set-CopilotCreditLimits.ps1 -Environment "Contoso Dev" -AgentCreditLimit 1000
 
-# 5. Dry run across a whole environment group
+# 4. Dry run across a whole environment group.
 .\Set-CopilotCreditLimits.ps1 -EnvironmentGroup "Personal Productivity" -AgentCreditLimit 500 -WhatIf
 
-# 6. Apply across the group, with exclusions and a hard stop
+# 5. Apply across the group, with exclusions and a hard stop.
 .\Set-CopilotCreditLimits.ps1 -EnvironmentGroup "Personal Productivity" `
     -AgentCreditLimit 500 -StopAgentIfOverLimit `
     -ExcludeAgentIdCsv .\samples\agent-exclusions.csv -Force
 ```
 
-Users pass:
-
-```powershell
-.\Set-CopilotCreditLimits.ps1 -EnvironmentGroup "Personal Productivity" `
-    -Scope Users -UserCreditLimit 100 -UserGroup "Copilot Makers" `
-    -ExcludeUserIdCsv .\samples\user-exclusions.csv
-```
-
-Both in one run:
-
-```powershell
-.\Set-CopilotCreditLimits.ps1 -EnvironmentGroup "Personal Productivity" `
-    -Scope Both -AgentCreditLimit 500 -UserCreditLimit 100 -UserGroup "Copilot Makers"
-```
+Then confirm in **Licensing → Copilot Studio → Manage Agents**.
 
 ---
 
@@ -123,169 +99,125 @@ Both in one run:
 | --- | --- |
 | `-EnvironmentGroup` | Environment group ID or exact display name. All environments in the group are targeted. |
 | `-Environment` | One or more environment IDs or exact display names. |
-| `-Scope` | `Agents` (default), `Users`, or `Both`. |
 | `-AgentCreditLimit` | Monthly Copilot Credit limit applied to each agent. |
-| `-AgentNotificationThreshold` | Notify at this **percentage** (1-100) of the limit. Default 80. The API defines this field as a percentage, not a credit count. |
-| `-NotifyIfOverCapacity` | Notify when the agent exceeds its limit. On by default (`-NotifyIfOverCapacity:$false` to disable). |
+| `-AgentNotificationThreshold` | Notify at this **percentage** of the limit. Default 80. The admin center restricts this to **50-100**. |
+| `-NotifyIfOverCapacity` | Notify when an agent exceeds its limit. On by default. |
 | `-StopAgentIfOverLimit` | Hard stop: turn the agent off at the limit. |
-| `-UserCreditLimit` | Per-user limit recorded in the report (see "report-only" above). |
-| `-UserGroup` | Entra group object ID or display name; scopes and labels the user report. |
 | `-ExcludeAgentId` / `-ExcludeAgentIdCsv` | Agents to skip — inline IDs, or a CSV. |
-| `-ExcludeUserId` / `-ExcludeUserIdCsv` | Users to skip — inline IDs/UPNs, or a CSV. |
-| `-AgentSource` | `Licensing`, `Dataverse`, or `Both` (default). |
+| `-IncludeFlows` | Also write limits to flows. See [Flows](#flows). |
+| `-AgentSource` | `Inventory`, `Licensing`, `Dataverse`, or `All` (default). |
 | `-LookbackDays` | Consumption snapshot window. Default 90. |
 | `-ReportPath` | Folder for the CSV report. Default `.\reports`. |
 | `-Discover` | Read-only raw API dump for the first target environment. |
 | `-ReportOnly` | Inventory current limits without writing. |
-| `-ProbeUserThresholdApi` | Test whether a user-threshold endpoint exists in your tenant. |
 | `-TenantId` | Tenant to sign in to. |
-| `-Force` | Skip confirmation and rewrite limits even when unchanged. |
+| `-Force` | Skip confirmations; rewrite limits even when unchanged. |
 | `-Diagnostics` | Extra detail about discovery and API fallbacks. |
 | `-WhatIf` / `-Confirm` | Standard PowerShell safety switches. |
 
-### Exclusion files
+### Exclusions
 
-A header named `AgentId`, `ResourceId`, `BotId` or `Id` (users: `UserId`, `ObjectId`, `Upn`, `Email`, `Id`)
-is used when present; otherwise every non-empty line of the file is treated as an ID. See `samples\`.
-A single exclusion can be passed inline instead: `-ExcludeAgentId 1111...-1111`.
+A header named `AgentId`, `ResourceId`, `BotId` or `Id` is used when present; otherwise every
+non-empty line is treated as an ID. See `samples\agent-exclusions.csv`. A single exclusion can be
+passed inline: `-ExcludeAgentId 1111...-1111`.
 
-> **Safety:** if an exclusion file is supplied but yields **zero** exclusions — because it's empty or its
-> ID column wasn't recognised — the script **stops with an error** instead of running. Passing the
-> parameter means you intend to protect something, and silently continuing would apply the limit to
-> *every* agent. Exclusion files are parsed before any network call, so mistakes fail immediately.
-
----
-
-## Verified behaviour
-
-Tested against a live tenant on 19 September 2026:
-
-| Check | Result |
-| --- | --- |
-| Environment resolution (BAP admin API) | 19 environments listed |
-| Agent discovery (licensing + Dataverse) | 18 agents, all named |
-| Environment-scoped threshold lookup | thresholds belonging to other environments correctly ignored |
-| `-WhatIf` | no writes issued |
-| Write | 18/18 succeeded |
-| **Read-back proof** | subsequent read returned the written limit for every agent |
-| Exclusions | 17 targeted, 1 correctly skipped |
-| Empty exclusion file | refused, as designed |
-
-Two API details worth knowing, both confirmed against a live tenant:
-
-- The threshold route must be called with **`api-version=1`** (see the note at the top). The
-  documented `2024-10-01` accepts the write and persists it, but the limit never reaches the
-  enforcement surface.
-- `notificationThreshold` is a **percentage**, and the admin center restricts it to **50-100**.
-- `licensing/entitlements/{id}/resourceThresholds` is **tenant-wide** — records must be matched on
-  `environmentId` *and* `resourceId`. Matching on `resourceId` alone lets a threshold from one
-  environment be mistaken for another environment's.
-
-### Known API quirks
-
-- `licensing/entitlements/MCSMessages/environments/{envId}/resources` can return **403** for a
-  delegated admin token even when the same data renders in the admin center. Agents are still
-  discovered from Dataverse and limits still write; only the `Consumed` column is blank.
-- Date parameters are **camelCase** on the REST API (`fromDate` / `toDate`). The kebab-case spelling
-  is the `pac` CLI flag name and is rejected with HTTP 400.
-
-### Troubleshooting
-
-**`Target environments: 0` with `-EnvironmentGroup`**
-
-Run again with `-Verbose`. The output shows which endpoint answered, and if no environment matched the
-group, the script prints the group values every environment actually reported so you can see whether
-the group is empty or whether membership is exposed on a field it doesn't read. Targeting the
-environments directly with `-Environment` always works as a fallback.
+> **Safety:** if an exclusion file is supplied but yields **zero** exclusions — because it is empty or
+> its column was not recognised — the script **stops**. Passing the parameter means you intend to
+> protect something, and continuing would apply the limit to *every* agent. Exclusions are also
+> validated against the discovered resources **before** anything is written, so a typo or stale ID is
+> reported rather than silently protecting nothing.
 
 ---
 
-## How agents are discovered
+## Flows
 
-| Source | Gives you | Caveat |
-| --- | --- | --- |
-| **Licensing** (`licensing/entitlements/MCSMessages/environments/{envId}/resources`) | Resource IDs that are guaranteed valid for the threshold API, plus month-to-date consumption. | Only agents that have consumed credits appear. Can return 403 (see quirks). |
-| **Dataverse** (`bots` table) | Every agent in the environment, with display names. | **Requires you to be a member of that environment's Dataverse instance.** |
+Agent flows and cloud flows can consume Copilot Credits — AI Builder actions and agent flow actions
+are common cost drivers — so they are **always inventoried and reported**, with a `ResourceType`
+column in the CSV.
 
-`-AgentSource Both` (default) merges the two, so you get names *and* coverage of never-used agents.
+They are **not written to by default.** The threshold API is proven for agents; whether a limit on a
+flow is actually enforced is **not yet confirmed**. `-IncludeFlows` targets them deliberately.
 
-### Environments you cannot inspect
-
-Being a **Power Platform administrator is not sufficient** to read an environment's `bots` table. You
-must be a member (System Administrator) of the Dataverse instance itself. This commonly affects
-**personal developer environments**, which are exactly the ones that tend to consume credits
-unintentionally.
-
-The script never treats an inaccessible environment as empty. It reports:
-
-| Action | Meaning |
-| --- | --- |
-| `NoAgentsFound` | The environment was inspected and genuinely contains no agents. |
-| `NotInspected` | The environment **could not be read**. Its agents are **unknown**, and no limit was applied. |
-
-Every run ends with an **INCOMPLETE COVERAGE** section listing the environments that could not be
-fully inspected and why. Do not read such a run as confirming those environments are clean.
-
-To include them, add yourself as a System Administrator in each environment and rerun. **For
-environments you cannot access, the effective control is the environment-group rule that disables
-drawing from the tenant pool, combined with a zero credit allocation** — that constrains an
-environment without needing visibility into its contents.
+If you use it, **verify in Manage Agents** that the flow appears with its limit before relying on it.
 
 ---
 
 ## Report
 
-Every run writes `reports\CopilotCreditLimits-yyyyMMdd-HHmmss.csv` and prints a summary. Columns:
+Every run writes `reports\CopilotCreditLimits-yyyyMMdd-HHmmss.csv` and prints a summary.
 
-`Timestamp, Scope, EnvironmentName, EnvironmentId, TargetId, TargetName, Source, Action,
-PreviousLimit, NewLimit, NotificationThresholdPct, StopIfOverCapacity, Consumed, Message`
+`Timestamp, Scope, EnvironmentName, EnvironmentId, TargetId, TargetName, Source, ResourceType,
+Action, PreviousLimit, NewLimit, NotificationThresholdPct, StopIfOverCapacity, Consumed, Message`
 
-`Action` values: `Set`, `Skipped-Excluded`, `Skipped-NoChange`, `WhatIf`, `ReportOnly`,
-`NoAgentsFound`, `NotInspected`, `Failed`.
+| `Action` | Meaning |
+| --- | --- |
+| `Set` | Limit applied. |
+| `Skipped-Excluded` | Listed in the exclusions. |
+| `Skipped-NoChange` | Already has this limit. |
+| `Skipped-Flow` | A flow, and `-IncludeFlows` was not used. |
+| `WhatIf` / `ReportOnly` | No change written. |
+| `NoAgentsFound` | Environment inspected, genuinely empty. |
+| `NotInspected` | Environment **could not be read** — its agents are **unknown**. |
+| `Failed` | The write failed; see `Message`. |
 
-> `NoAgentsFound` and `NotInspected` mean different things. The first is a confirmed empty
-> environment; the second is an environment that could not be read at all. Treat `NotInspected` rows
-> as gaps in coverage, not as clean results.
+> `NoAgentsFound` and `NotInspected` mean different things. Treat `NotInspected` rows as gaps in
+> coverage, not clean results. Every run ends with an **INCOMPLETE COVERAGE** section if any exist.
+
+---
+
+## What this does not do
+
+**There is no way to cap Copilot Studio credits per user.** Tested against a live tenant: no control
+in the Power Platform admin center, nothing in Entra or Azure, and every plausible API route returns
+"not found".
+
+- The admin center now has a per-user **consumption view** (Licensing → Copilot Studio → Users). That
+  is reporting, not a limit.
+- Microsoft 365 **Cost Management** spending policies *do* offer a hard per-user monthly cap scoped to
+  an Entra group — but that experience is currently scoped to **Cowork and Work IQ API**, so it does
+  not govern Copilot Studio agent credits.
+- The older pay-as-you-go billing **budget only sends alerts. It does not stop consumption.**
+
+The enforceable controls today are **environment allocation**, **tenant-pool draw**, and **per-agent
+limits**.
 
 ---
 
 ## Scheduling
 
-Because the script is idempotent (`Skipped-NoChange`) and non-interactive with `-Force`, it can run on a
-schedule to re-assert limits as new agents appear:
-
-```powershell
-schtasks /create /tn "Copilot credit limits" /sc DAILY /st 06:00 /tr `
-  "powershell -NoProfile -File \"C:\path\Set-CopilotCreditLimits.ps1\" -EnvironmentGroup \"Personal Productivity\" -AgentCreditLimit 500 -Force"
-```
-
-Unattended runs need a non-interactive auth path (service principal / managed identity) instead of the
-interactive `Connect-AzAccount` used here.
+The script is idempotent (`Skipped-NoChange`) and non-interactive with `-Force`, so it can run on a
+schedule to re-assert limits as new agents appear. Unattended runs need a non-interactive auth path
+(service principal or managed identity) rather than the interactive `Connect-AzAccount` used here.
 
 ---
 
 ## Notes and limits
 
-- Entitlement ID for Copilot Credits is `MCSMessages`; API version `2024-10-01`.
-- These licensing operations are **preview**. Run `-Discover` first if a tenant returns unexpected shapes —
-  the script tries several documented path/parameter spellings and reports which one worked under `-Verbose`.
-- Environment-group rules can lock capacity settings (`TenantPoolLockedByPolicy`). Agent-level thresholds are
-  independent of the environment allocation, but the environment must still have capacity available.
+- Entitlement ID for Copilot Credits is `MCSMessages`.
+- `resourceThresholds` is **tenant-wide**: records must be matched on `environmentId` **and**
+  `resourceId`. Matching on `resourceId` alone lets a threshold from one environment be mistaken for
+  another's.
+- Date parameters are **camelCase** (`fromDate` / `toDate`). Kebab-case is the `pac` CLI flag
+  spelling and is rejected with HTTP 400.
+- A published environment-group rule can lock capacity settings (`TenantPoolLockedByPolicy`).
+- Provided **as-is**, as personal tooling rather than a Microsoft product. Test it in a
+  non-production environment first.
+
+See [`docs/API-GUIDE.md`](docs/API-GUIDE.md) for a map of the licensing, governance, copilotstudio
+and usermanagement namespaces.
 
 ## References
 
 - [Manage Copilot Credits and capacity for Copilot Studio](https://learn.microsoft.com/power-platform/admin/manage-copilot-studio-copilot-credits-capacity)
 - [Tutorial: Manage Copilot Credits allocations programmatically](https://learn.microsoft.com/power-platform/admin/programmability-tutorial-manage-copilot-credit-allocations)
-- [`pac licensing` reference](https://learn.microsoft.com/power-platform/developer/cli/reference/licensing)
-- [Managing AI experiences enabled by usage-based billing](https://learn.microsoft.com/microsoft-365/copilot/usage-based-billing-manage-copilot-credits)
 - [Power Platform licensing OpenAPI spec](https://github.com/MicrosoftDocs/power-platform/blob/main/power-platform/developer/reference/licensing/licensing.json)
 
 ## Prior art
 
 [`jameswh3/MW-Toolbox`](https://github.com/jameswh3/MW-Toolbox) includes
 `Set-CopilotAgentConsumptionLimit.ps1`, which sets the threshold for a **single** agent. This repo
-covers the bulk case: environment-group enumeration, multi-environment runs, agent discovery with
-name enrichment, exclusions, dry runs and reporting.
+covers the bulk case: environment-group enumeration, multi-environment runs, admin-scoped discovery,
+exclusions, dry runs and reporting.
 
 ## License
 

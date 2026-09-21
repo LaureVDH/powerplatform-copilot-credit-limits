@@ -3,30 +3,30 @@
 
 <#
 .SYNOPSIS
-Applies Copilot Credit (MCSMessages) consumption limits to every agent in one or more Power Platform
+Applies Copilot Credit (MCSMessages) monthly limits to the agents in one or more Power Platform
 environments, or in every environment of an environment group, and reports what was done.
 
 .DESCRIPTION
-Connects with an interactive Power Platform admin account through Az.Accounts, resolves the target
-environments (single environment, list of environments, or all environments of an environment group),
-inventories the Copilot Studio agents in each environment, and writes a per-agent Copilot Credit
-threshold through the Power Platform licensing API:
+Signs in interactively as a Power Platform admin through Az.Accounts, resolves the target
+environments, inventories the Copilot Studio agents in each one, and writes a per-agent Copilot
+Credit threshold through the Power Platform licensing API:
 
     PUT licensing/environments/{environmentId}/entitlements/MCSMessages/resources/{resourceId}/threshold
 
-Agents are discovered from two complementary sources:
+IMPORTANT - the api-version matters. The published licensing spec documents api-version=2024-10-01.
+The Power Platform admin center calls this route with api-version=1, and only that version takes
+effect: a limit written with 2024-10-01 returns 200 and persists in resourceThresholds, but never
+appears in Licensing > Copilot Studio > Manage Agents and does not enforce. This script writes with
+api-version=1 and falls back to the documented version.
 
-  * Licensing  - agents that already have Copilot Credit consumption records. These resource IDs are
-                 guaranteed to be valid targets for the threshold API.
-  * Dataverse  - the 'bots' table of the environment. Adds display names and surfaces agents that have
-                 never consumed a credit yet.
+Agents are discovered from three complementary sources:
 
-Users (-Scope Users or Both) are inventoried and reported, but not written to. The Power Platform
-licensing API exposes user data as read-only operations (tenant user snapshots and consumption by
-user); there is no supported per-user credit limit write operation. Per-user spending limits are
-configured in the Microsoft 365 admin center under Copilot > Cost Management (spending policies),
-which has no public REST API today. Use -ProbeUserThresholdApi to test whether a user-scoped threshold
-endpoint has appeared in your tenant.
+  * Inventory  - the admin-scoped Power Platform inventory that backs Manage > Inventory. It is the
+                 only source that sees inside environments the caller is not a member of, such as
+                 personal developer environments, where Dataverse returns HTTP 403.
+  * Licensing  - agents that already have Copilot Credit consumption records. Adds month-to-date
+                 consumption.
+  * Dataverse  - the 'bots' table of the environment. Adds display names.
 
 .PARAMETER EnvironmentGroup
 Environment group ID or exact display name. Every environment of the group is targeted.
@@ -34,109 +34,76 @@ Environment group ID or exact display name. Every environment of the group is ta
 .PARAMETER Environment
 One or more environment IDs or exact environment display names.
 
-.PARAMETER Scope
-What to process: Agents (default), Users, or Both.
-
 .PARAMETER AgentCreditLimit
-Monthly Copilot Credit limit to apply to each agent. Required when the scope includes agents, unless
--Discover or -ReportOnly is used.
+Monthly Copilot Credit limit to apply to each agent. Required unless -Discover or -ReportOnly is used.
 
 .PARAMETER AgentNotificationThreshold
-Percentage of the agent limit at which administrators are notified. Defaults to 80.
-The API defines this as a percentage, and the admin center restricts it to 50-100.
+Percentage of the limit at which administrators are notified. Defaults to 80. The API treats this as
+a percentage, and the admin center restricts it to 50-100.
 
 .PARAMETER NotifyIfOverCapacity
-Send a notification when the agent exceeds its limit. Defaults to on; use -NotifyIfOverCapacity:$false to disable.
+Send a notification when an agent exceeds its limit. On by default; use -NotifyIfOverCapacity:$false
+to disable.
 
 .PARAMETER StopAgentIfOverLimit
 Turn the agent off when it reaches its limit (hard stop).
-
-.PARAMETER UserCreditLimit
-Per-user Copilot Credit limit to report against. Recorded in the report only; see the description.
-
-.PARAMETER UserGroup
-Entra ID group object ID or display name. When supplied, the user report is scoped to and labelled
-with that group instead of listing every user of the environment.
 
 .PARAMETER ExcludeAgentId
 One or more agent/resource IDs to skip.
 
 .PARAMETER ExcludeAgentIdCsv
 Path to a CSV of agent/resource IDs to skip. A header named AgentId, ResourceId, BotId or Id is
-honoured; a headerless single-column file also works.
-
-.PARAMETER ExcludeUserId
-One or more user IDs (Entra object ID, Dataverse systemuserid, or UPN) to skip in the user report.
-
-.PARAMETER ExcludeUserIdCsv
-Path to a CSV of user IDs to skip. Header UserId, ObjectId, Upn, Email or Id is honoured.
+honoured; a headerless single-column file also works. An exclusion file that yields zero exclusions
+stops the run, because it would otherwise silently protect nothing.
 
 .PARAMETER AgentSource
-Where to discover agents: Licensing, Dataverse, Inventory, or All (default).
-
-Inventory is the Power Platform inventory that backs Manage > Inventory in the admin center. It is
-admin-scoped, so it sees inside environments the caller is not a member of - including personal
-developer environments, where Dataverse returns HTTP 403.
+Where to discover agents: Inventory, Licensing, Dataverse, or All (default).
 
 .PARAMETER IncludeFlows
-Also apply limits to agent flows and cloud flows, not only Copilot Studio agents.
+Also write limits to agent flows and cloud flows, not only Copilot Studio agents.
 
-Flows can consume Copilot Credits (AI Builder actions, agent flow actions), so they are always
-inventoried and reported. They are NOT written to by default, because the per-resource threshold API
-is documented and proven for agents, and applying it to a flow is unverified. Use this switch to
-target them deliberately, and check the report for failures.
+Flows can consume Copilot Credits, so they are always inventoried and reported. They are NOT written
+to by default: the threshold API is proven for agents, and enforcement for flows is not yet
+confirmed. Use this switch to target them deliberately and verify the result in the admin center.
 
 .PARAMETER LookbackDays
-How far back the licensing consumption snapshot is queried. Default 90.
+How far back the consumption snapshot is queried. Default 90.
 
 .PARAMETER ReportPath
 Folder for the CSV report. Default: .\reports
 
 .PARAMETER Discover
-Read-only mode: dump the raw API responses for the first target environment so you can verify the
-shape of these preview APIs in your tenant. Nothing is written.
+Read-only mode: dump the raw API responses for the first target environment.
 
 .PARAMETER ReportOnly
 Inventory and report current limits without writing anything.
-
-.PARAMETER ProbeUserThresholdApi
-Test whether a user-scoped threshold endpoint exists in your tenant. Read-only.
-
-.PARAMETER ElevateWhenDenied
-When an environment's Dataverse instance cannot be read (HTTP 403), grant the calling account the
-System Administrator role in that environment and retry the agent discovery.
-
-This is the same mechanism the Power Platform admin center uses when an administrator opens an
-environment they are not a member of, and it is how a Power Platform admin or CoE team can inventory
-personal developer environments. It calls:
-
-    POST usermanagement/environments/{environmentId}/user/applyAdminRole
-
-Note what this does: it is a WRITE that permanently adds the calling account as a System Administrator
-of that environment, including personal developer environments belonging to individual users. It is
-therefore off by default, it is always reported, and it is skipped under -WhatIf. Elevation is only
-attempted for environments that actually returned 403.
 
 .PARAMETER TenantId
 Optional tenant ID to pass to Connect-AzAccount.
 
 .PARAMETER Force
-Skip the confirmation prompt and rewrite limits even when the current value already matches.
+Skip confirmation prompts and rewrite limits even when the current value already matches.
 
 .PARAMETER Diagnostics
 Show extra detail about discovery and API fallbacks.
 
 .EXAMPLE
-.\Set-CopilotCreditLimits.ps1 -Environment "Contoso Dev" -Discover
+.\Set-CopilotCreditLimits.ps1 -Environment "Contoso Dev" -ReportOnly
+
+Inventories the agents and shows their current limits. Writes nothing.
 
 .EXAMPLE
-.\Set-CopilotCreditLimits.ps1 -Environment "00000000-0000-0000-0000-000000000000" -AgentCreditLimit 1000 -WhatIf
+.\Set-CopilotCreditLimits.ps1 -Environment "Contoso Dev" -AgentCreditLimit 1000 -WhatIf
+
+Shows exactly which agents would be changed.
 
 .EXAMPLE
 .\Set-CopilotCreditLimits.ps1 -EnvironmentGroup "Personal Productivity" -AgentCreditLimit 500 -StopAgentIfOverLimit -ExcludeAgentIdCsv .\samples\agent-exclusions.csv -Force
 
-.EXAMPLE
-.\Set-CopilotCreditLimits.ps1 -EnvironmentGroup "Personal Productivity" -Scope Both -AgentCreditLimit 500 -UserCreditLimit 100 -UserGroup "Copilot Makers"
+Applies a 500 credit limit with a hard stop to every agent in the group, except those listed.
+
+.LINK
+https://github.com/LaureVDH/powerplatform-copilot-credit-limits
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Group')]
@@ -150,9 +117,6 @@ param
     [ValidateNotNullOrEmpty()]
     [string[]] $Environment,
 
-    [Parameter()]
-    [ValidateSet('Agents', 'Users', 'Both')]
-    [string] $Scope = 'Agents',
 
     [Parameter()]
     [ValidateRange(0, 2147483647)]
@@ -168,12 +132,6 @@ param
     [Parameter()]
     [switch] $StopAgentIfOverLimit,
 
-    [Parameter()]
-    [ValidateRange(0, 2147483647)]
-    [int] $UserCreditLimit,
-
-    [Parameter()]
-    [string] $UserGroup,
 
     [Parameter()]
     [string[]] $ExcludeAgentId,
@@ -181,11 +139,6 @@ param
     [Parameter()]
     [string] $ExcludeAgentIdCsv,
 
-    [Parameter()]
-    [string[]] $ExcludeUserId,
-
-    [Parameter()]
-    [string] $ExcludeUserIdCsv,
 
     [Parameter()]
     [ValidateSet('Licensing', 'Dataverse', 'Inventory', 'All')]
@@ -206,27 +159,6 @@ param
 
     [Parameter()]
     [switch] $ReportOnly,
-
-    [Parameter()]
-    [switch] $ProbeUserThresholdApi,
-
-    [Parameter()]
-    [switch] $ElevateWhenDenied,
-
-    [Parameter()]
-    [string] $ProbeUserId,
-
-    [Parameter()]
-    [string] $ProbeGroupId,
-
-    [Parameter()]
-    [switch] $ProbeResourceIdValidation,
-
-    [Parameter()]
-    [switch] $CompareThresholds,
-
-    [Parameter()]
-    [string] $ProbeTeamId,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
@@ -1415,38 +1347,6 @@ function Get-InventoryResources
     return $inventoryResult
 }
 
-function Grant-EnvironmentAdminRole
-{
-    <#
-        Grants the CALLING account the System Administrator role in an environment.
-
-        This is the documented admin path into an environment the caller is not a member of - the
-        same operation the Power Platform admin center performs when an administrator opens someone
-        else's environment, including a personal developer environment. It is what allows a Power
-        Platform admin or CoE team to inventory agents estate-wide.
-
-        It is a genuine privilege change and it persists, so callers must opt in explicitly.
-    #>
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [string] $TargetEnvironmentId
-    )
-
-    $path = 'usermanagement/environments/{0}/user/applyAdminRole' -f $TargetEnvironmentId
-
-    try
-    {
-        Invoke-PowerPlatformApi -Method POST -PathOrUri $path -Body @{} | Out-Null
-        return [PSCustomObject]@{ Succeeded = $true; Error = $null }
-    }
-    catch
-    {
-        return [PSCustomObject]@{ Succeeded = $false; Error = $_.Exception.Message }
-    }
-}
-
 function Get-DataverseAgents
 {
     <#
@@ -1787,51 +1687,6 @@ function Invoke-AgentScope
             {
                 $dataverseResult = Get-DataverseAgents -InstanceApiUrl $instanceUrl
 
-                # An environment the caller is not a member of returns 403. A Power Platform admin
-                # can grant themselves the System Administrator role there and retry, which is how
-                # personal developer environments are brought into scope.
-                if (-not $dataverseResult.Succeeded -and $dataverseResult.StatusCode -eq 403 -and $ElevateWhenDenied)
-                {
-                    if ($WhatIfPreference)
-                    {
-                        Write-Host ("  [WhatIf] Would grant System Administrator on '{0}' to read its agents." -f $environmentName) -ForegroundColor Cyan
-                    }
-                    else
-                    {
-                        Write-Host ("  [elevate] Granting System Administrator on '{0}' to enumerate agents..." -f $environmentName) -ForegroundColor Cyan
-                        $elevation = Grant-EnvironmentAdminRole -TargetEnvironmentId $environmentId
-
-                        if ($elevation.Succeeded)
-                        {
-                            $script:ElevatedEnvironments.Add([PSCustomObject]@{
-                                EnvironmentName = $environmentName
-                                EnvironmentId   = $environmentId
-                            }) | Out-Null
-
-                            # Access has changed, so the cached 403 is stale.
-                            if ($script:DataverseCache) { $script:DataverseCache.Remove($instanceUrl) | Out-Null }
-
-                            # Role assignment is not always effective on the very next call.
-                            Start-Sleep -Seconds 5
-                            $dataverseResult = Get-DataverseAgents -InstanceApiUrl $instanceUrl
-
-                            if ($dataverseResult.Succeeded)
-                            {
-                                Write-Host ("  [elevate] Access granted; {0} agent(s) now visible." -f $dataverseResult.Agents.Count) -ForegroundColor Green
-                            }
-                            else
-                            {
-                                Write-Host ("  [elevate] Role granted but the read still failed: {0}" -f $dataverseResult.Error) -ForegroundColor Yellow
-                                Write-Host '            Role assignment can take a minute to apply. Rerun to pick it up.' -ForegroundColor Yellow
-                            }
-                        }
-                        else
-                        {
-                            Write-Host ("  [elevate] Could not grant the role: {0}" -f $elevation.Error) -ForegroundColor Red
-                        }
-                    }
-                }
-
                 if (-not $dataverseResult.Succeeded)
                 {
                     # Inventory is admin-scoped and sees into environments the caller is not a member
@@ -1849,9 +1704,9 @@ function Invoke-AgentScope
                         $discoveryFailed = $true
                         $discoveryError = $dataverseResult.Error
 
-                        if ($dataverseResult.StatusCode -eq 403 -and -not $ElevateWhenDenied)
+                        if ($dataverseResult.StatusCode -eq 403)
                         {
-                            $discoveryError = "$($dataverseResult.Error). Rerun with -ElevateWhenDenied to grant access and include this environment."
+                            $discoveryError = "$($dataverseResult.Error). The admin inventory did not cover it either, so its agents are unknown."
                         }
 
                         Write-Host ("  [WARN]  Agents could not be enumerated in '{0}': {1}" -f $environmentName, $discoveryError) -ForegroundColor Red
@@ -2073,1007 +1928,6 @@ function Invoke-AgentScope
 
 #endregion
 
-#region Users
-
-function Get-EntraGroupMembers
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [string] $GroupIdOrName
-    )
-
-    $token = Get-AccessToken -ResourceUrl $GraphApiRoot -TenantId $TenantId
-    $headers = @{ Authorization = "Bearer $token"; Accept = 'application/json' }
-    $groupId = $GroupIdOrName
-
-    if ($GroupIdOrName -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
-    {
-        $filter = [uri]::EscapeDataString("displayName eq '$GroupIdOrName'")
-        $lookupUri = '{0}/v1.0/groups?$filter={1}&$select=id,displayName' -f $GraphApiRoot, $filter
-        $lookup = Invoke-RestMethod -Method GET -Uri $lookupUri -Headers $headers -ErrorAction Stop
-
-        if (@($lookup.value).Count -eq 0)
-        {
-            throw "Entra group '$GroupIdOrName' was not found."
-        }
-
-        if (@($lookup.value).Count -gt 1)
-        {
-            throw "Entra group name '$GroupIdOrName' matched more than one group. Use the group object ID."
-        }
-
-        $groupId = $lookup.value[0].id
-    }
-
-    $members = New-Object System.Collections.Generic.List[object]
-    $uri = '{0}/v1.0/groups/{1}/transitiveMembers/microsoft.graph.user?$select=id,displayName,userPrincipalName&$top=999' -f $GraphApiRoot, $groupId
-
-    do
-    {
-        $response = Invoke-RestMethod -Method GET -Uri $uri -Headers $headers -ErrorAction Stop
-
-        foreach ($member in @($response.value))
-        {
-            $members.Add($member) | Out-Null
-        }
-
-        $uri = $response.'@odata.nextLink'
-    }
-    while ($uri)
-
-    return [PSCustomObject]@{
-        GroupId = $groupId
-        Members = $members.ToArray()
-    }
-}
-
-function Get-EnvironmentUsers
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [string] $InstanceApiUrl
-    )
-
-    $makerIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-
-    try
-    {
-        $query = 'systemusers?$select=systemuserid,fullname,internalemailaddress,azureactivedirectoryobjectid,isdisabled&$filter=isdisabled eq false and applicationid eq null&$orderby=fullname asc'
-        $users = @(Invoke-DataverseApi -InstanceApiUrl $InstanceApiUrl -Path $query)
-    }
-    catch
-    {
-        Write-Warning "Could not read Dataverse users at $InstanceApiUrl. $($_.Exception.Message)"
-        return @()
-    }
-
-    try
-    {
-        $makerRoles = @(Invoke-DataverseApi -InstanceApiUrl $InstanceApiUrl -Path 'roles?$select=roleid,name&$filter=name eq ''Environment Maker''')
-
-        foreach ($role in $makerRoles)
-        {
-            $roleQuery = 'systemusers?$select=systemuserid&$filter=systemuserroles_association/any(r:r/roleid eq {0})' -f $role.roleid
-            $roleUsers = @(Invoke-DataverseApi -InstanceApiUrl $InstanceApiUrl -Path $roleQuery)
-
-            foreach ($roleUser in $roleUsers)
-            {
-                $makerIds.Add("$($roleUser.systemuserid)") | Out-Null
-            }
-        }
-    }
-    catch
-    {
-        Write-Verbose "Could not resolve Environment Maker role membership. $($_.Exception.Message)"
-    }
-
-    return @($users | ForEach-Object {
-        [PSCustomObject]@{
-            SystemUserId = "$($_.systemuserid)"
-            ObjectId     = "$($_.azureactivedirectoryobjectid)"
-            DisplayName  = "$($_.fullname)"
-            Upn          = "$($_.internalemailaddress)"
-            IsMaker      = $makerIds.Contains("$($_.systemuserid)")
-        }
-    })
-}
-
-function Get-LicensingUserConsumption
-{
-    [CmdletBinding()]
-    param()
-
-    $fromDate = (Get-Date).AddDays(-$LookbackDays).ToString('yyyy-MM-dd')
-    $toDate = (Get-Date).ToString('yyyy-MM-dd')
-    $map = @{}
-
-    foreach ($template in @(
-        'licensing/entitlements/{0}/users?fromDate={1}&toDate={2}',
-        'licensing/entitlements/{0}/users?from-date={1}&to-date={2}&page-size=200'
-    ))
-    {
-        $path = $template -f $EntitlementId, $fromDate, $toDate
-
-        try
-        {
-            $rows = @(Invoke-PowerPlatformApi -Method GET -PathOrUri $path -AllPages)
-
-            foreach ($row in $rows)
-            {
-                $userRows = if ($row.users) { @($row.users) } else { @($row) }
-
-                foreach ($userRow in $userRows)
-                {
-                    $userId = "$(Get-PropertyValue -InputObject $userRow -Paths @('userId', 'UserId', 'id', 'objectId'))"
-
-                    if ($userId)
-                    {
-                        $map[$userId] = $userRow
-                    }
-                }
-            }
-
-            Write-Verbose "Loaded $($map.Count) user consumption row(s) from '$path'."
-            return $map
-        }
-        catch
-        {
-            Write-Verbose "User consumption path failed: '$path'. $($_.Exception.Message)"
-        }
-    }
-
-    Write-Warning 'Could not read tenant user consumption for MCSMessages.'
-    return $map
-}
-
-function Test-RouteMethod
-{
-    <#
-        Determines whether a route EXISTS and which methods it accepts, without creating anything.
-
-        A GET returning 404 does not prove a route is absent: many REST APIs return 404 from GET
-        simply because no record exists yet, while the corresponding PUT would create one. Two
-        safe signals distinguish the cases:
-
-          OPTIONS            - never writes. Some gateways return an Allow header listing methods.
-          PUT, invalid body  - a route that exists validates the body and rejects it with 400 or 422
-                               BEFORE writing anything. A route that does not exist returns 404 or 405
-                               without ever looking at the body.
-
-        The deliberately invalid body below uses a negative limit and a bogus field, so a real
-        endpoint has no valid interpretation of it and must reject it.
-
-        Status codes, and what they mean here:
-          404  route absent
-          405  route EXISTS, method not allowed   <- strong positive
-          400/422  route EXISTS, body rejected    <- strong positive
-          401/403  route EXISTS, access denied    <- positive
-          2xx  route exists and accepted the call <- investigate immediately
-    #>
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [string] $Path,
-
-        [Parameter(Mandatory = $true)]
-        [ValidateSet('GET', 'OPTIONS', 'PUT')]
-        [string] $Method
-    )
-
-    $token = Get-AccessToken -ResourceUrl $PowerPlatformApiRoot -TenantId $TenantId
-    $separator = if ($Path.Contains('?')) { '&' } else { '?' }
-    $uri = '{0}/{1}{2}api-version={3}' -f $PowerPlatformApiRoot.TrimEnd('/'), $Path.TrimStart('/'), $separator, $ApiVersion
-
-    $headers = @{
-        Authorization = "Bearer $token"
-        Accept        = 'application/json'
-    }
-
-    $parameters = @{
-        Method                 = $Method
-        Uri                    = $uri
-        Headers                = $headers
-        UseBasicParsing        = $true
-        ErrorAction            = 'Stop'
-    }
-
-    if ($Method -eq 'PUT')
-    {
-        # Intentionally invalid: a negative limit and an unknown field. A live endpoint must reject
-        # this during validation rather than persist it.
-        $parameters['ContentType'] = 'application/json'
-        $parameters['Body'] = (@{
-            limit                       = -1
-            notificationThreshold       = -1
-            __scoutProbeDoNotPersist    = $true
-        } | ConvertTo-Json)
-    }
-
-    try
-    {
-        $response = Invoke-WebRequest @parameters
-        return [PSCustomObject]@{
-            StatusCode = [int] $response.StatusCode
-            Allow      = "$($response.Headers['Allow'])"
-            Body       = "$($response.Content)"
-        }
-    }
-    catch
-    {
-        $statusCode = $null
-        $allow = ''
-        $body = ''
-
-        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
-        {
-            $statusCode = [int] $_.Exception.Response.StatusCode
-
-            try { $allow = "$($_.Exception.Response.Headers.Allow)" } catch { }
-        }
-
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message)
-        {
-            $body = "$($_.ErrorDetails.Message)"
-        }
-
-        return [PSCustomObject]@{
-            StatusCode = $statusCode
-            Allow      = $allow
-            Body       = $body
-        }
-    }
-}
-
-function Compare-ThresholdRows
-{
-    <#
-        Dumps every row in the tenant-wide resourceThresholds collection with all of its fields.
-
-        Purpose: when a limit set through the admin center behaves differently from one written
-        through the API, comparing the two rows field by field shows what the API write is missing.
-        The admin center row is the known-good reference.
-    #>
-    [CmdletBinding()]
-    param()
-
-    Write-Section 'All resource thresholds in this tenant'
-
-    try
-    {
-        $thresholds = @(Invoke-PowerPlatformApiWithVersions -PathOrUri ('licensing/entitlements/{0}/resourceThresholds' -f $EntitlementId) -ApiVersions $ThresholdApiVersions)
-    }
-    catch
-    {
-        Write-Host "Could not read resourceThresholds: $($_.Exception.Message)" -ForegroundColor Red
-        return
-    }
-
-    Write-Host ("Rows: {0}" -f $thresholds.Count) -ForegroundColor Green
-    Write-Host ''
-
-    $thresholds |
-        Select-Object resourceId, environmentId, limit, notificationThreshold, notifyIfOverCapacity, stopIfOverCapacity, stopResource, resourceConsumption, createdOn |
-        Format-Table -AutoSize |
-        Out-Host
-
-    Write-Host ''
-    Write-Host 'Full JSON for every row, so an admin-center row can be compared with an API-written one:' -ForegroundColor Cyan
-    $thresholds | ConvertTo-Json -Depth 10 | Write-Host
-
-    Write-Host ''
-    Write-Host 'What to look for' -ForegroundColor Cyan
-    Write-Host '----------------' -ForegroundColor Cyan
-    Write-Host '  Find the row whose limit matches one you set in the admin center. Compare it with a' -ForegroundColor Yellow
-    Write-Host '  row this script wrote. Any field present on the first and absent or different on the' -ForegroundColor Yellow
-    Write-Host '  second is a candidate explanation for why the API-written limit is not enforced.' -ForegroundColor Yellow
-}
-
-function Test-ResourceIdValidation
-{
-    <#
-        Tests what the PROVEN threshold route accepts as a resourceId.
-
-            PUT licensing/environments/{env}/entitlements/{ent}/resources/{resourceId}/threshold
-
-        Unlike the speculative user and group routes, this path definitely exists, so its responses
-        are meaningful. The question is whether it validates resourceId against real resources, or
-        stores whatever it is given.
-
-        The control experiment comes first, and it matters:
-
-          1. PUT with a RANDOM GUID that belongs to nothing.
-             - Rejected (400/404) -> the API validates resourceId. Any later acceptance of a team or
-               group ID is therefore a real signal.
-             - Accepted (2xx)     -> the API does NOT validate resourceId. It will accept anything,
-               so acceptance proves nothing, and a threshold written against a team ID would be an
-               orphaned row that enforces nothing. This would also cast doubt on the flow results.
-
-          2. Read the tenant-wide resourceThresholds collection back and see whether the random GUID
-             actually persisted. Acceptance and persistence are different things.
-
-          3. Only if the control is rejected does a supplied team or group ID tell us anything.
-    #>
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [string] $TargetEnvironmentId,
-
-        [Parameter()]
-        [string] $TeamId
-    )
-
-    Write-Section 'Probe: what does the threshold route accept as a resourceId?'
-
-    Write-Host 'This uses the PROVEN per-resource threshold route, so its answers are meaningful.' -ForegroundColor Cyan
-    Write-Host 'A control with a random GUID runs first, to establish whether resourceId is validated.' -ForegroundColor Cyan
-    Write-Host ''
-
-    $controlId = [guid]::NewGuid().ToString()
-
-    $cases = New-Object System.Collections.Generic.List[object]
-    $cases.Add([PSCustomObject]@{ Label = 'CONTROL - random GUID (belongs to nothing)'; Id = $controlId }) | Out-Null
-
-    if ($TeamId)
-    {
-        Write-Host ''
-        Write-Host '  NOTE: the control below determines whether testing a team ID can tell us anything.' -ForegroundColor Yellow
-        Write-Host '  If the control is accepted, the route accepts ANY GUID, and a 200 for the team ID' -ForegroundColor Yellow
-        Write-Host '  would carry no information at all.' -ForegroundColor Yellow
-        $cases.Add([PSCustomObject]@{ Label = 'Dataverse team / group ID'; Id = $TeamId }) | Out-Null
-    }
-
-    $results = New-Object System.Collections.Generic.List[object]
-
-    foreach ($case in $cases)
-    {
-        $path = 'licensing/environments/{0}/entitlements/{1}/resources/{2}/threshold' -f $TargetEnvironmentId, $EntitlementId, $case.Id
-
-        $body = @{
-            entitlementId         = $EntitlementId
-            environmentId         = $TargetEnvironmentId
-            resourceId            = $case.Id
-            limit                 = 1
-            notificationThreshold = 80
-            notifyIfOverCapacity  = $false
-            stopIfOverCapacity    = $false
-            stopResource          = $false
-        }
-
-        $statusCode = $null
-        $detail = ''
-
-        try
-        {
-            Invoke-PowerPlatformApi -Method PUT -PathOrUri $path -Body $body | Out-Null
-            $statusCode = 200
-        }
-        catch
-        {
-            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
-            {
-                $statusCode = [int] $_.Exception.Response.StatusCode
-            }
-
-            if ($_.ErrorDetails -and $_.ErrorDetails.Message)
-            {
-                $detail = "$($_.ErrorDetails.Message)"
-            }
-        }
-
-        $results.Add([PSCustomObject]@{
-            Label      = $case.Label
-            Id         = $case.Id
-            StatusCode = $statusCode
-            Detail     = $detail
-        }) | Out-Null
-
-        $colour = if ($statusCode -eq 200) { 'Yellow' } else { 'Green' }
-        Write-Host ("  [{0}]  {1}" -f $statusCode, $case.Label) -ForegroundColor $colour
-
-        if ($detail)
-        {
-            Write-Host "         $detail" -ForegroundColor DarkGray
-        }
-    }
-
-    # Acceptance is not persistence. Read the tenant-wide collection back and check.
-    Write-Host ''
-    Write-Host '  Reading resourceThresholds back to check what actually persisted...' -ForegroundColor Cyan
-
-    # Get-ResourceThresholdMap always queries, so this read-back is fresh.
-    $map = Get-ResourceThresholdMap
-
-    foreach ($result in $results)
-    {
-        $key = Get-ThresholdKey -EnvironmentId $TargetEnvironmentId -ResourceId $result.Id
-        $persisted = $map.ContainsKey($key)
-
-        $result | Add-Member -NotePropertyName Persisted -NotePropertyValue $persisted -Force
-
-        Write-Host ("  persisted={0,-5} {1}" -f $persisted, $result.Label) -ForegroundColor $(if ($persisted) { 'Yellow' } else { 'Green' })
-    }
-
-    $control = $results[0]
-
-    Write-Host ''
-    Write-Host 'Interpretation' -ForegroundColor Cyan
-    Write-Host '--------------' -ForegroundColor Cyan
-
-    if ($control.StatusCode -ge 200 -and $control.StatusCode -lt 300)
-    {
-        Write-Host '  The route ACCEPTED a random GUID that belongs to no resource.' -ForegroundColor Red
-        Write-Host '  It therefore does NOT validate resourceId, and acceptance proves nothing:' -ForegroundColor Red
-        Write-Host '    - A threshold written against a team or group ID would be an orphaned row' -ForegroundColor Red
-        Write-Host '      that enforces nothing.' -ForegroundColor Red
-        Write-Host '    - The same caveat applies to the flow results: the API accepting a flow ID' -ForegroundColor Red
-        Write-Host '      does not by itself prove flows are enforced.' -ForegroundColor Red
-        Write-Host '    - It also limits what write-then-read verification proves. Reading a threshold' -ForegroundColor Red
-        Write-Host '      back confirms the record PERSISTED; it does not confirm anything ENFORCES it.' -ForegroundColor Red
-        Write-Host ''
-        Write-Host '  The only reliable confirmation is the admin center: Licensing > Copilot Studio >' -ForegroundColor Red
-        Write-Host '  Manage Agents should show the limit against the agent. If it does, real agents are' -ForegroundColor Red
-        Write-Host '  enforced and the threshold table is simply a permissive key-value store.' -ForegroundColor Red
-
-        if ($control.Persisted)
-        {
-            Write-Host ''
-            Write-Host '  The junk row PERSISTED. Attempting to remove it...' -ForegroundColor Yellow
-
-            $cleanupPath = 'licensing/environments/{0}/entitlements/{1}/resources/{2}/threshold' -f $TargetEnvironmentId, $EntitlementId, $control.Id
-            $removed = $false
-
-            # The licensing spec documents no DELETE on this route, but try it before falling back.
-            try
-            {
-                Invoke-PowerPlatformApi -Method DELETE -PathOrUri $cleanupPath | Out-Null
-                Write-Host '  DELETE succeeded.' -ForegroundColor Green
-                $removed = $true
-            }
-            catch
-            {
-                $deleteStatus = $null
-
-                if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
-                {
-                    $deleteStatus = [int] $_.Exception.Response.StatusCode
-                }
-
-                Write-Host "  DELETE not supported (HTTP $deleteStatus). Neutralising the row instead..." -ForegroundColor Yellow
-
-                # Cannot delete, so make the row inert: no limit, no notification, no stop.
-                try
-                {
-                    Invoke-PowerPlatformApi -Method PUT -PathOrUri $cleanupPath -Body @{
-                        entitlementId         = $EntitlementId
-                        environmentId         = $TargetEnvironmentId
-                        resourceId            = $control.Id
-                        limit                 = 0
-                        notificationThreshold = 100
-                        notifyIfOverCapacity  = $false
-                        stopIfOverCapacity    = $false
-                        stopResource          = $false
-                    } | Out-Null
-
-                    Write-Host '  Row set to limit 0 with all enforcement off, so it cannot affect anything.' -ForegroundColor Green
-                }
-                catch
-                {
-                    Write-Host "  Could not neutralise the row: $($_.Exception.Message)" -ForegroundColor Red
-                }
-            }
-
-            if (-not $removed)
-            {
-                Write-Host ''
-                Write-Host '  The row remains in resourceThresholds, keyed to a resource that does not exist:' -ForegroundColor Yellow
-                Write-Host "    $($control.Id)" -ForegroundColor Yellow
-                Write-Host '  It is inert - nothing consumes credits under that ID - but it will appear in' -ForegroundColor Yellow
-                Write-Host '  the tenant-wide threshold list. It will not appear in Manage Agents, because' -ForegroundColor Yellow
-                Write-Host '  there is no agent to show.' -ForegroundColor Yellow
-            }
-        }
-    }
-    else
-    {
-        Write-Host '  The route REJECTED a random GUID, so it does validate resourceId.' -ForegroundColor Green
-        Write-Host '  Results for any real ID tested above are therefore meaningful.' -ForegroundColor Green
-
-        if ($TeamId)
-        {
-            $team = $results | Where-Object { $_.Id -eq $TeamId } | Select-Object -First 1
-
-            if ($team.StatusCode -ge 200 -and $team.StatusCode -lt 300)
-            {
-                Write-Host ''
-                Write-Host '  The team / group ID was ACCEPTED. This is a genuine finding - group-scoped' -ForegroundColor Green
-                Write-Host '  limits may be possible through the resource route. Confirm in the admin' -ForegroundColor Green
-                Write-Host '  center that it appears and enforces, then it can be implemented.' -ForegroundColor Green
-            }
-            else
-            {
-                Write-Host ''
-                Write-Host '  The team / group ID was rejected. The route is for agents and flows only.' -ForegroundColor Yellow
-            }
-        }
-    }
-
-    return $results.ToArray()
-}
-
-function Test-UserThresholdApi
-{
-    <#
-        MC1451872 (public preview 22-Aug-2026) announced per-user capacity limits INSIDE a Power
-        Platform environment, alongside the existing per-agent limits. That capability is not present
-        in the published licensing OpenAPI spec (2024-10-01), which exposes only GET operations for
-        users plus the single resource-threshold PUT.
-
-        This probe therefore tests, read-only, whether a user-scoped threshold endpoint has shipped in
-        the caller's tenant. Candidates are built by symmetry with the documented resource shapes:
-
-            per resource : licensing/environments/{env}/entitlements/{ent}/resources/{id}/threshold
-            collection   : licensing/entitlements/{ent}/resourceThresholds
-
-        404 means the route does not exist. 403 means the route EXISTS but the caller lacks permission,
-        which is still a positive signal. Any 2xx is a hit.
-    #>
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [string] $TargetEnvironmentId,
-
-        [Parameter(Mandatory = $true)]
-        [string] $UserId
-    )
-
-    $candidates = @(
-        # Routes mirroring the PPAC Users page itself:
-        #   admin.preview.powerplatform.microsoft.com/billing/licenses/agents/CopilotStudio/users
-        'licensing/entitlements/{1}/users/{2}',
-        'licensing/entitlements/{1}/users/{2}/threshold',
-        'licensing/entitlements/{1}/userThresholds/{2}',
-        'licensing/entitlements/{1}/userThresholds',
-        'licensing/entitlements/{1}/users/{2}/limit',
-        'licensing/entitlements/{1}/users/{2}/capacity',
-
-        # Environment-scoped variants, mirroring the per-resource threshold route.
-        'licensing/environments/{0}/entitlements/{1}/users/{2}/threshold',
-        'licensing/environments/{0}/entitlements/{1}/users/{2}/userThreshold',
-        'licensing/environments/{0}/entitlements/{1}/userThresholds/{2}',
-        'licensing/environments/{0}/entitlements/{1}/userThresholds',
-        'licensing/environments/{0}/entitlements/{1}/users/{2}/capacity',
-        'licensing/environments/{0}/entitlements/{1}/users/{2}/limit',
-        'licensing/environments/{0}/entitlements/{1}/userCapacityLimits',
-        'licensing/entitlements/{1}/environments/{0}/users/{2}/threshold',
-
-        # The agents/CopilotStudio wording used by the preview portal URL.
-        'licensing/agents/CopilotStudio/users/{2}/threshold',
-        'licensing/agents/{1}/users/{2}/threshold',
-
-        # GROUP-scoped routes. Microsoft 365 Cost Management scopes per-user spending limits to an
-        # Entra security group rather than to individuals, so Power Platform may mirror that model.
-        # {3} is the group ID when -ProbeGroupId is supplied.
-        'licensing/entitlements/{1}/groups/{3}/threshold',
-        'licensing/entitlements/{1}/groups/{3}/userThreshold',
-        'licensing/entitlements/{1}/groupThresholds/{3}',
-        'licensing/entitlements/{1}/groupThresholds',
-        'licensing/environments/{0}/entitlements/{1}/groups/{3}/threshold',
-        'licensing/environments/{0}/entitlements/{1}/groupThresholds/{3}',
-        'licensing/entitlements/{1}/securityGroups/{3}/threshold',
-        'licensing/spendingPolicies',
-        'licensing/entitlements/{1}/spendingPolicies'
-    )
-
-    # The PPAC preview portal may serve this page from the BAP host rather than api.powerplatform.com.
-    # Probing absolute BAP URLs tests that hypothesis directly.
-    $bapCandidates = @(
-        'https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/environments/{0}/licensing/users/{2}/threshold?api-version=2020-10-01',
-        'https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/licensing/entitlements/{1}/users/{2}/threshold?api-version=2020-10-01',
-        'https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/scopes/admin/licensing/entitlements/{1}/userThresholds?api-version=2020-10-01'
-    )
-
-    $found = New-Object System.Collections.Generic.List[string]
-
-    # Guard against unsubstituted placeholders. A value like "<entra-group-guid>" produces a route
-    # that cannot match anything, so its 404 would be meaningless while looking like a real result.
-    foreach ($check in @(
-        @{ Name = '-ProbeUserId'; Value = $UserId },
-        @{ Name = '-ProbeGroupId'; Value = $ProbeGroupId }
-    ))
-    {
-        if ($check.Value -and ($check.Value -match '^<.*>$' -or $check.Value -match '[<>]'))
-        {
-            Write-Host ''
-            Write-Host ("  WARNING: {0} looks like an unsubstituted placeholder: '{1}'" -f $check.Name, $check.Value) -ForegroundColor Red
-            Write-Host '  Routes built from it cannot match anything, so their 404s prove nothing.' -ForegroundColor Red
-            Write-Host '  Supply a real GUID to make this probe meaningful.' -ForegroundColor Red
-        }
-    }
-
-    Write-Host ''
-    Write-Host '  Probing for a per-user threshold endpoint (MC1451872 preview)...' -ForegroundColor Cyan
-
-    foreach ($template in $candidates)
-    {
-        if ($template -like '*{3}*' -and -not $ProbeGroupId)
-        {
-            continue
-        }
-
-        $path = $template -f $TargetEnvironmentId, $EntitlementId, $UserId, $ProbeGroupId
-
-        # 1. GET. A 404 here is inconclusive - it may mean the record does not exist rather than
-        #    that the route is absent - so a 404 escalates to the method probes below.
-        $get = Test-RouteMethod -Path $path -Method GET
-
-        if ($get.StatusCode -ge 200 -and $get.StatusCode -lt 300)
-        {
-            Write-Host "  [HIT]   GET $path" -ForegroundColor Green
-            $found.Add("GET $path") | Out-Null
-
-            if ($Diagnostics -and $get.Body)
-            {
-                Write-Host "          $($get.Body)" -ForegroundColor DarkGray
-            }
-
-            continue
-        }
-
-        if ($get.StatusCode -eq 401 -or $get.StatusCode -eq 403)
-        {
-            Write-Host "  [$($get.StatusCode)]   GET $path - ROUTE EXISTS, access denied." -ForegroundColor Yellow
-            $found.Add("$path (GET $($get.StatusCode) - exists, access denied)") | Out-Null
-            continue
-        }
-
-        # 2. OPTIONS. Never writes; some gateways return an Allow header listing methods.
-        $options = Test-RouteMethod -Path $path -Method OPTIONS
-
-        if ($options.Allow)
-        {
-            Write-Host "  [ALLOW] $path -> $($options.Allow)" -ForegroundColor Green
-            $found.Add("$path (Allow: $($options.Allow))") | Out-Null
-            continue
-        }
-
-        # 3. PUT with a deliberately invalid body. A route that exists validates and rejects it
-        #    before writing; a route that does not exist answers 404 or 405 without reading it.
-        $put = Test-RouteMethod -Path $path -Method PUT
-
-        if ($put.StatusCode -eq 405)
-        {
-            Write-Host "  [405]   PUT $path - ROUTE EXISTS, PUT not allowed." -ForegroundColor Yellow
-            $found.Add("$path (405 - exists, PUT not allowed)") | Out-Null
-        }
-        elseif ($put.StatusCode -eq 400 -or $put.StatusCode -eq 422)
-        {
-            Write-Host "  [$($put.StatusCode)]   PUT $path - ROUTE EXISTS; invalid body rejected." -ForegroundColor Green
-            $found.Add("$path (PUT $($put.StatusCode) - exists, body validated)") | Out-Null
-
-            if ($put.Body)
-            {
-                Write-Host "          $($put.Body)" -ForegroundColor DarkGray
-            }
-        }
-        elseif ($put.StatusCode -eq 401 -or $put.StatusCode -eq 403)
-        {
-            Write-Host "  [$($put.StatusCode)]   PUT $path - ROUTE EXISTS, access denied." -ForegroundColor Yellow
-            $found.Add("$path (PUT $($put.StatusCode) - exists, access denied)") | Out-Null
-        }
-        elseif ($put.StatusCode -ge 200 -and $put.StatusCode -lt 300)
-        {
-            Write-Host "  [!!!]   PUT $path ACCEPTED AN INVALID BODY ($($put.StatusCode))." -ForegroundColor Red
-            Write-Host '          Verify in the admin center whether anything was written.' -ForegroundColor Red
-            $found.Add("$path (PUT $($put.StatusCode) - ACCEPTED, verify)") | Out-Null
-        }
-        else
-        {
-            Write-Host ("  [404]   {0}  (GET {1} / PUT {2})" -f $path, $get.StatusCode, $put.StatusCode) -ForegroundColor DarkGray
-        }
-    }
-
-    foreach ($template in $bapCandidates)
-    {
-        $uri = $template -f $TargetEnvironmentId, $EntitlementId, $UserId
-        $shortUri = $uri -replace '^https://api\.bap\.microsoft\.com/providers/Microsoft\.BusinessAppPlatform/scopes/admin/', 'BAP:'
-
-        try
-        {
-            $token = Get-AccessToken -ResourceUrl 'https://api.bap.microsoft.com' -TenantId $TenantId
-            $response = Invoke-RestMethod -Method GET -Uri $uri -Headers @{ Authorization = "Bearer $token"; Accept = 'application/json' } -ErrorAction Stop
-
-            Write-Host "  [HIT]   $shortUri" -ForegroundColor Green
-            $found.Add($uri) | Out-Null
-
-            if ($Diagnostics)
-            {
-                $response | ConvertTo-Json -Depth 8 | Write-Host
-            }
-        }
-        catch
-        {
-            $statusCode = $null
-
-            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response)
-            {
-                $statusCode = [int] $_.Exception.Response.StatusCode
-            }
-
-            if ($statusCode -eq 403 -or $statusCode -eq 400)
-            {
-                Write-Host "  [$statusCode]   $shortUri - route may exist. Worth following up." -ForegroundColor Yellow
-                $found.Add("$uri ($statusCode)") | Out-Null
-            }
-            else
-            {
-                Write-Host "  [$statusCode]   $shortUri" -ForegroundColor DarkGray
-            }
-        }
-    }
-
-    Write-Host ''
-
-    if ($found.Count -gt 0)
-    {
-        Write-Host '  A user-scoped endpoint responded. Per-user limits may be programmable here:' -ForegroundColor Green
-        $found | ForEach-Object { Write-Host "    $_" -ForegroundColor Green }
-        Write-Host '  Share this output so the write path can be implemented.' -ForegroundColor Green
-    }
-    else
-    {
-        Write-Host '  No user-scoped threshold endpoint responded in this tenant.' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host '  To be clear about what this means for Copilot Studio agent credits (MCSMessages):' -ForegroundColor Yellow
-        Write-Host '  there is currently NO way found to cap consumption per user - not by API, and not' -ForegroundColor Yellow
-        Write-Host '  in any admin centre UI that could be located.' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host '    - Power Platform admin center: MC1451872 added a per-user consumption VIEW' -ForegroundColor Yellow
-        Write-Host '      (Licensing > Copilot Studio > Users). That is tracking, not a limit. No' -ForegroundColor Yellow
-        Write-Host '      "set limit" control was found there for users.' -ForegroundColor Yellow
-        Write-Host '    - Microsoft 365 Cost Management spending policies DO offer a hard per-user' -ForegroundColor Yellow
-        Write-Host '      monthly cap, but that experience is currently scoped to Cowork and Work IQ' -ForegroundColor Yellow
-        Write-Host '      API. It does not govern Copilot Studio agent credits.' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host '  The enforceable controls for Copilot Studio credits today are:' -ForegroundColor Yellow
-        Write-Host '    1. Environment allocation, with tenant-pool draw disabled.' -ForegroundColor Yellow
-        Write-Host '    2. Per-agent monthly limits - which is what this script applies.' -ForegroundColor Yellow
-    }
-
-    return $found.ToArray()
-}
-
-function Invoke-UserScope
-{
-    [CmdletBinding()]
-    param
-    (
-        [Parameter(Mandatory = $true)]
-        [object[]] $Environments,
-
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyCollection()]
-        [System.Collections.Generic.HashSet[string]] $Exclusions,
-
-        [Parameter(Mandatory = $true)]
-        [AllowEmptyCollection()]
-        [System.Collections.Generic.List[object]] $Report
-    )
-
-    Write-Section 'Users'
-    Write-Host 'Per-user Copilot Credit caps: what is actually possible today.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  Copilot Studio / Power Platform credits (entitlement MCSMessages) - what this' -ForegroundColor Yellow
-    Write-Host '  script writes. Limits here apply to AGENTS (and flows) ONLY. No way to cap a USER' -ForegroundColor Yellow
-    Write-Host '  has been found: every /users route in the licensing API is read-only, and no' -ForegroundColor Yellow
-    Write-Host '  user-limit control could be located in the Power Platform admin center.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  MC1451872 (preview, 22-Aug-2026) added a per-user consumption VIEW under' -ForegroundColor Yellow
-    Write-Host '  Licensing > Copilot Studio > Users. That is tracking, not enforcement.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  Microsoft 365 Cost Management spending policies DO provide a hard per-user monthly' -ForegroundColor Yellow
-    Write-Host '  cap, scoped to an Entra group. But that experience is currently scoped to Cowork and' -ForegroundColor Yellow
-    Write-Host '  Work IQ API, so it does NOT govern Copilot Studio agent credits. Where it does' -ForegroundColor Yellow
-    Write-Host '  apply, the pattern is: Entra group -> spending policy -> per-user monthly limit,' -ForegroundColor Yellow
-    Write-Host '  minimum 2,000 credits/user/month (7,000 recommended), reconciled periodically so a' -ForegroundColor Yellow
-    Write-Host '  user can briefly exceed the cap; that overage is not billed. No public API.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  Note: the older PAYG billing-policy "budget" only sends alerts. It does NOT stop usage.' -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  The inventory below is provided so you can build those policies, and to show who is' -ForegroundColor Yellow
-    Write-Host '  consuming. Use -UserGroup to scope it to a group.' -ForegroundColor Yellow
-
-    $groupMembers = $null
-    $groupLabel = ''
-
-    if ($UserGroup)
-    {
-        try
-        {
-            $groupResult = Get-EntraGroupMembers -GroupIdOrName $UserGroup
-            $groupLabel = $UserGroup
-            $groupMembers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-
-            foreach ($member in $groupResult.Members)
-            {
-                $groupMembers.Add("$($member.id)") | Out-Null
-
-                if ($member.userPrincipalName)
-                {
-                    $groupMembers.Add("$($member.userPrincipalName)") | Out-Null
-                }
-            }
-
-            Write-Host "User group '$UserGroup' ($($groupResult.GroupId)): $($groupResult.Members.Count) member(s)." -ForegroundColor Green
-        }
-        catch
-        {
-            Write-Warning "Could not expand the Entra group '$UserGroup'. $($_.Exception.Message)"
-        }
-    }
-
-    $consumption = Get-LicensingUserConsumption
-
-    foreach ($environmentObject in $Environments)
-    {
-        $environmentId = Get-EnvironmentId -EnvironmentObject $environmentObject
-        $environmentName = Get-EnvironmentDisplayName -EnvironmentObject $environmentObject
-        $instanceUrl = Get-EnvironmentInstanceApiUrl -EnvironmentObject $environmentObject
-
-        Write-Host ''
-        Write-Host "Environment: $environmentName ($environmentId)" -ForegroundColor Cyan
-
-        if (-not $instanceUrl)
-        {
-            Write-Warning 'No Dataverse instance URL; skipping the user inventory for this environment.'
-            continue
-        }
-
-        $users = @(Get-EnvironmentUsers -InstanceApiUrl $instanceUrl)
-        $makerCount = @($users | Where-Object { $_.IsMaker }).Count
-        Write-Host ("Users: {0} (makers: {1})" -f $users.Count, $makerCount) -ForegroundColor Green
-
-        if ($ProbeUserThresholdApi)
-        {
-            # Probe with a user the LICENSING API actually knows. A Dataverse user with no Copilot
-            # Credit consumption may be unknown to licensing and return 404 for reasons unrelated to
-            # whether the route exists, which would produce a false negative.
-            # NOTE: PowerShell variable names are case-insensitive, so a local named $probeUserId
-            # would be the SAME variable as the $ProbeUserId parameter and would silently overwrite
-            # the caller's value. The local is therefore named differently on purpose.
-            $resolvedProbeUser = $null
-            $probeUserSource = $null
-
-            if ($ProbeUserId)
-            {
-                $resolvedProbeUser = $ProbeUserId
-                $probeUserSource = 'the -ProbeUserId parameter'
-            }
-            elseif ($consumption.Keys.Count -gt 0)
-            {
-                # Prefer a user that actually consumed credits, and never probe with an empty GUID.
-                $bestKey = $null
-
-                foreach ($key in $consumption.Keys)
-                {
-                    if ("$key" -eq '00000000-0000-0000-0000-000000000000' -or -not "$key".Trim())
-                    {
-                        continue
-                    }
-
-                    $consumedValue = Get-PropertyValue -InputObject $consumption[$key] -Paths @('consumed', 'Consumed')
-
-                    if ($null -ne $consumedValue -and [double] $consumedValue -gt 0)
-                    {
-                        $bestKey = $key
-                        break
-                    }
-
-                    if (-not $bestKey)
-                    {
-                        $bestKey = $key
-                    }
-                }
-
-                if ($bestKey)
-                {
-                    $resolvedProbeUser = $bestKey
-                    $probeUserSource = 'the licensing user consumption snapshot'
-                }
-            }
-
-            if (-not $resolvedProbeUser -and $users.Count -gt 0)
-            {
-                $consumingUser = $users | Where-Object { $_.ObjectId } | Select-Object -First 1
-
-                if ($consumingUser)
-                {
-                    $resolvedProbeUser = $consumingUser.ObjectId
-                    $probeUserSource = 'Dataverse (no licensing user found - result may be a false negative)'
-                }
-            }
-
-            if ($resolvedProbeUser)
-            {
-                Write-Host ''
-                Write-Host "  Probe user: $resolvedProbeUser (from $probeUserSource)" -ForegroundColor Cyan
-                Test-UserThresholdApi -TargetEnvironmentId $environmentId -UserId $resolvedProbeUser | Out-Null
-            }
-            else
-            {
-                Write-Warning 'No user was available to probe with. Pass -ProbeUserId explicitly.'
-            }
-        }
-
-        foreach ($user in $users)
-        {
-            $identifiers = @($user.ObjectId, $user.SystemUserId, $user.Upn) | Where-Object { $_ }
-
-            if ($groupMembers)
-            {
-                $inGroup = @($identifiers | Where-Object { $groupMembers.Contains($_) }).Count -gt 0
-
-                if (-not $inGroup)
-                {
-                    continue
-                }
-            }
-
-            $action = 'ReportOnly'
-            $message = 'User-level limits require Microsoft 365 Copilot Cost Management spending policies.'
-
-            if (@($identifiers | Where-Object { $Exclusions.Contains($_) }).Count -gt 0)
-            {
-                $action = 'Skipped-Excluded'
-                $message = 'Listed in the user exclusions.'
-            }
-
-            $consumed = $null
-
-            foreach ($identifier in $identifiers)
-            {
-                if ($consumption.ContainsKey($identifier))
-                {
-                    $consumed = Get-PropertyValue -InputObject $consumption[$identifier] -Paths @('consumed', 'Consumed')
-                    break
-                }
-            }
-
-            $scopeLabel = if ($groupLabel) { "User ($groupLabel)" } else { 'User' }
-            $targetId = if ($user.ObjectId) { $user.ObjectId } else { $user.SystemUserId }
-            $targetName = if ($user.Upn) { "$($user.DisplayName) <$($user.Upn)>" } else { $user.DisplayName }
-            $sourceLabel = if ($user.IsMaker) { 'Dataverse (maker)' } else { 'Dataverse (user)' }
-            $plannedLimit = if ($PSBoundParameters.ContainsKey('UserCreditLimit')) { $UserCreditLimit } else { '' }
-
-            $Report.Add([PSCustomObject]@{
-                Timestamp             = (Get-Date).ToString('s')
-                Scope                 = $scopeLabel
-                EnvironmentName       = $environmentName
-                EnvironmentId         = $environmentId
-                TargetId              = $targetId
-                TargetName            = $targetName
-                Source                = $sourceLabel
-                ResourceType          = ''
-                Action                = $action
-                PreviousLimit         = ''
-                NewLimit              = $plannedLimit
-                NotificationThresholdPct = ''
-                StopIfOverCapacity    = ''
-                Consumed              = $consumed
-                Message               = $message
-            }) | Out-Null
-        }
-    }
-}
-
-#endregion
-
 #region Discover
 
 function Invoke-Discover
@@ -3141,10 +1995,12 @@ function Invoke-Discover
         }
     }
 
-    Write-Section 'Tenant user consumption (read-only)'
-    $userConsumption = Get-LicensingUserConsumption
-    Write-Host "Users with consumption: $($userConsumption.Count)"
-    $userConsumption.Values | Select-Object -First 5 | ConvertTo-Json -Depth 8 | Write-Host
+    Write-Section 'Existing thresholds for this environment'
+    $envThresholds = $thresholds.Values | Where-Object {
+        "$(Get-PropertyValue -InputObject $_ -Paths @('environmentId', 'EnvironmentId'))" -eq $environmentId
+    }
+    Write-Host ("Rows for this environment: {0}" -f @($envThresholds).Count)
+    $envThresholds | Select-Object -First 10 | ConvertTo-Json -Depth 8 | Write-Host
 }
 
 #endregion
@@ -3153,20 +2009,17 @@ function Invoke-Discover
 
 try
 {
-    $agentScopeRequested = ($Scope -eq 'Agents' -or $Scope -eq 'Both')
-
-    if ($agentScopeRequested -and -not $Discover -and -not $ReportOnly -and -not $ProbeResourceIdValidation -and -not $ProbeUserThresholdApi -and -not $CompareThresholds -and -not $PSBoundParameters.ContainsKey('AgentCreditLimit'))
+    if (-not $Discover -and -not $ReportOnly -and -not $PSBoundParameters.ContainsKey('AgentCreditLimit'))
     {
         throw 'Specify -AgentCreditLimit, or use -ReportOnly / -Discover for a read-only pass.'
     }
 
-    # notificationThreshold is a percentage (1-100) per the Power Platform licensing API contract.
+    # notificationThreshold is a percentage per the Power Platform licensing API contract.
     $script:EffectiveNotificationThreshold = $AgentNotificationThreshold
 
     # Parse exclusion files BEFORE any network call so a bad file fails immediately, rather than
     # after sign-in and environment enumeration.
     $agentExclusions = Get-ExclusionSet -InlineValues $ExcludeAgentId -CsvPath $ExcludeAgentIdCsv -ColumnCandidates @('AgentId', 'ResourceId', 'BotId', 'Id') -Label 'agent'
-    $userExclusions = Get-ExclusionSet -InlineValues $ExcludeUserId -CsvPath $ExcludeUserIdCsv -ColumnCandidates @('UserId', 'ObjectId', 'Upn', 'Email', 'Id') -Label 'user'
 
     $environments = @(Resolve-TargetEnvironments)
 
@@ -3193,33 +2046,12 @@ try
         return
     }
 
-    if ($CompareThresholds)
-    {
-        Compare-ThresholdRows
-        return
-    }
-
-    if ($ProbeResourceIdValidation)
-    {
-        Test-ResourceIdValidation -TargetEnvironmentId (Get-EnvironmentId -EnvironmentObject $environments[0]) -TeamId $ProbeTeamId | Out-Null
-        return
-    }
-
-
-
-
-
     if ($agentExclusions.Count -gt 0)
     {
         Write-Host "Agent exclusions: $($agentExclusions.Count)" -ForegroundColor Yellow
     }
 
-    if ($userExclusions.Count -gt 0)
-    {
-        Write-Host "User exclusions: $($userExclusions.Count)" -ForegroundColor Yellow
-    }
-
-    if ($agentScopeRequested -and -not $ReportOnly -and -not $Force -and -not $WhatIfPreference)
+    if (-not $ReportOnly -and -not $Force -and -not $WhatIfPreference)
     {
         $question = "Apply a Copilot Credit limit of $AgentCreditLimit to every agent in $($environments.Count) environment(s)?"
         $answer = Read-Host "$question [y/N]"
@@ -3233,13 +2065,10 @@ try
 
     $report = New-Object System.Collections.Generic.List[object]
     $script:NotInspectedEnvironments = New-Object System.Collections.Generic.List[object]
-    $script:ElevatedEnvironments = New-Object System.Collections.Generic.List[object]
 
-    if ($agentScopeRequested)
-    {
-        # Verify every exclusion matches a real resource BEFORE writing anything. An exclusion that
-        # matches nothing - a typo, a stale ID, an unsubstituted placeholder - would silently leave
-        # the resource it was meant to protect exposed to the write.
+    # Verify every exclusion matches a real resource BEFORE writing anything. An exclusion that
+    # matches nothing - a typo, a stale ID, an unsubstituted placeholder - would silently leave
+    # the resource it was meant to protect exposed to the write.
         if ($agentExclusions.Count -gt 0)
         {
             Write-Host ''
@@ -3286,13 +2115,7 @@ try
             $script:MatchedExclusions.Clear()
         }
 
-        Invoke-AgentScope -Environments $environments -Exclusions $agentExclusions -Report $report
-    }
-
-    if ($Scope -eq 'Users' -or $Scope -eq 'Both')
-    {
-        Invoke-UserScope -Environments $environments -Exclusions $userExclusions -Report $report
-    }
+    Invoke-AgentScope -Environments $environments -Exclusions $agentExclusions -Report $report
 
     Write-Section 'Summary'
 
@@ -3306,21 +2129,6 @@ try
         Group-Object Scope, Action |
         Sort-Object Name |
         ForEach-Object { Write-Host ("  {0,-45} {1}" -f $_.Name, $_.Count) }
-
-    if ($script:ElevatedEnvironments.Count -gt 0)
-    {
-        Write-Host ''
-        Write-Host 'PRIVILEGE CHANGES MADE' -ForegroundColor Yellow
-        Write-Host '----------------------' -ForegroundColor Yellow
-        Write-Host ("The calling account was granted System Administrator in {0} environment(s) to" -f $script:ElevatedEnvironments.Count) -ForegroundColor Yellow
-        Write-Host 'enumerate their agents. These grants persist until removed.' -ForegroundColor Yellow
-        Write-Host ''
-
-        $script:ElevatedEnvironments |
-            Select-Object EnvironmentName, EnvironmentId |
-            Format-Table -AutoSize |
-            Out-Host
-    }
 
     if ($script:NotInspectedEnvironments.Count -gt 0)
     {
@@ -3340,9 +2148,6 @@ try
         Write-Host 'a member of each environment. The Power Platform administrator role is not sufficient on' -ForegroundColor Yellow
         Write-Host 'its own - this commonly affects personal developer environments, and the Copilot Studio' -ForegroundColor Yellow
         Write-Host 'portal fails the same way for an administrator who is not a member.' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host 'Rerun with -ElevateWhenDenied to grant the calling account System Administrator in those' -ForegroundColor Yellow
-        Write-Host 'environments and include them. That is a persistent privilege change, so it is opt-in.' -ForegroundColor Yellow
         Write-Host ''
         Write-Host 'For environments you choose not to enter, the effective control is the environment-group' -ForegroundColor Yellow
         Write-Host 'rule that disables drawing from the tenant pool, combined with a zero credit allocation.' -ForegroundColor Yellow
