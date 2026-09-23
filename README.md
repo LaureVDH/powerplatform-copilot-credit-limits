@@ -135,10 +135,12 @@ Agent flows and cloud flows can consume Copilot Credits — AI Builder actions a
 are common cost drivers — so they are **always inventoried and reported**, with a `ResourceType`
 column in the CSV.
 
-They are **not written to by default.** The threshold API is proven for agents; whether a limit on a
-flow is actually enforced is **not yet confirmed**. `-IncludeFlows` targets them deliberately.
+They are **not written to by default.** `-IncludeFlows` targets them deliberately.
 
-If you use it, **verify in Manage Agents** that the flow appears with its limit before relying on it.
+The API accepts limits on flows and behaves identically to agents — including returning
+`NoAvailableCapacitySource` for flows in environments without a capacity source, and succeeding once
+one is present. That is good evidence they are handled by the same subsystem. **Enforcement has not
+yet been confirmed in the admin center**, so verify there before relying on a flow limit.
 
 ---
 
@@ -166,6 +168,31 @@ Action, PreviousLimit, NewLimit, NotificationThresholdPct, StopIfOverCapacity, C
 ---
 
 ## What this does not do
+
+### Environments with no capacity source
+
+A write can fail with:
+
+```
+HTTP 400 - NoAvailableCapacitySource - No environment allocation or tenant pool found.
+```
+
+An environment can consume Copilot Credits through exactly three routes: an **allocation**,
+**tenant-pool draw**, or a linked **pay-as-you-go billing plan**. If it has none of them, there is
+nothing for a per-agent limit to apply against, and the API says so.
+
+**This failure is usually good news.** An environment with no capacity source cannot consume credits
+at all — which is what a limit was trying to achieve. Treat it as confirmation, not a problem.
+
+> Do **not** add a billing plan or allocation just to make this script succeed. That would enable
+> spending in order to cap it. Give an environment a capacity source only when you intend it to
+> consume.
+
+Verified by controlled test: the same command against the same environments failed with
+`NoAvailableCapacitySource` before a billing plan was linked, and succeeded for every agent and flow
+afterwards. Nothing else changed.
+
+### Per-user limits
 
 **There is no way to cap Copilot Studio credits per user.** Tested against a live tenant: no control
 in the Power Platform admin center, nothing in Entra or Azure, and every plausible API route returns

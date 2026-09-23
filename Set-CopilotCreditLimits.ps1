@@ -1475,6 +1475,70 @@ function Get-ThresholdKey
     return ('{0}|{1}' -f $EnvironmentId, $ResourceId).ToLowerInvariant()
 }
 
+function Get-ApiErrorDetail
+{
+    <#
+        Extracts the API's own explanation from a failed request.
+
+        $_.Exception.Message only ever says "Response status code does not indicate success: 400
+        (Bad Request)", which is useless for diagnosis. The service puts the real reason in the
+        response body, which PowerShell exposes on $_.ErrorDetails.Message.
+    #>
+    [CmdletBinding()]
+    param
+    (
+        [Parameter(Mandatory = $true)]
+        [object] $ErrorRecord
+    )
+
+    $statusCode = $null
+
+    if ($ErrorRecord.Exception.PSObject.Properties['Response'] -and $ErrorRecord.Exception.Response)
+    {
+        $statusCode = [int] $ErrorRecord.Exception.Response.StatusCode
+    }
+
+    $detail = ''
+
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message)
+    {
+        $raw = "$($ErrorRecord.ErrorDetails.Message)".Trim()
+
+        # Most Power Platform errors are JSON: { "error": { "code": "...", "message": "..." } }
+        try
+        {
+            $parsed = $raw | ConvertFrom-Json -ErrorAction Stop
+
+            $code = Get-PropertyValue -InputObject $parsed -Paths @('error.code', 'code', 'Code')
+            $message = Get-PropertyValue -InputObject $parsed -Paths @('error.message', 'message', 'Message')
+
+            if ($message)
+            {
+                $detail = if ($code) { "$code - $message" } else { "$message" }
+            }
+            else
+            {
+                $detail = $raw
+            }
+        }
+        catch
+        {
+            $detail = $raw
+        }
+    }
+
+    if (-not $detail)
+    {
+        $detail = $ErrorRecord.Exception.Message
+    }
+
+    return [PSCustomObject]@{
+        StatusCode = $statusCode
+        Detail     = $detail
+        Text       = if ($statusCode) { "HTTP $statusCode - $detail" } else { $detail }
+    }
+}
+
 function Set-AgentThreshold
 {
     [CmdletBinding()]
@@ -1518,16 +1582,31 @@ function Set-AgentThreshold
 
     foreach ($version in $ThresholdApiVersions)
     {
-        try
+        # The service throttles bulk writes with HTTP 429, so retry that specific case with backoff.
+        for ($attempt = 1; $attempt -le 4; $attempt++)
         {
-            $result = Invoke-PowerPlatformApi -Method PUT -PathOrUri $path -Body $body -ApiVersionOverride $version
-            Write-Verbose "Threshold write for $ResourceId succeeded with api-version=$version."
-            return $result
-        }
-        catch
-        {
-            $lastError = $_
-            Write-Verbose "Threshold write failed with api-version=$version. $($_.Exception.Message)"
+            try
+            {
+                $result = Invoke-PowerPlatformApi -Method PUT -PathOrUri $path -Body $body -ApiVersionOverride $version
+                Write-Verbose "Threshold write for $ResourceId succeeded with api-version=$version."
+                return $result
+            }
+            catch
+            {
+                $lastError = $_
+                $info = Get-ApiErrorDetail -ErrorRecord $_
+
+                if ($info.StatusCode -eq 429 -and $attempt -lt 4)
+                {
+                    $delay = [Math]::Pow(2, $attempt)
+                    Write-Verbose "Throttled writing $ResourceId (HTTP 429). Retrying in $delay second(s)."
+                    Start-Sleep -Seconds $delay
+                    continue
+                }
+
+                Write-Verbose "Threshold write failed with api-version=$version. $($info.Text)"
+                break
+            }
         }
     }
 
@@ -1916,9 +1995,16 @@ function Invoke-AgentScope
             }
             catch
             {
+                $info = Get-ApiErrorDetail -ErrorRecord $_
                 $row.Action = 'Failed'
-                $row.Message = $_.Exception.Message
-                Write-Detail ("  [fail]  {0} ({1}) - {2}" -f $agent.DisplayName, $agent.ResourceId, $_.Exception.Message) -ForegroundColor Red
+                $row.Message = $info.Text
+                Write-Detail ("  [fail]  {0} ({1}) - {2}" -f $agent.DisplayName, $agent.ResourceId, $info.Text) -ForegroundColor Red
+
+                $script:FailureReasons.Add([PSCustomObject]@{
+                    EnvironmentName = $environmentName
+                    StatusCode      = $info.StatusCode
+                    Detail          = $info.Detail
+                }) | Out-Null
             }
 
             $Report.Add([PSCustomObject]$row) | Out-Null
@@ -2065,6 +2151,7 @@ try
 
     $report = New-Object System.Collections.Generic.List[object]
     $script:NotInspectedEnvironments = New-Object System.Collections.Generic.List[object]
+    $script:FailureReasons = New-Object System.Collections.Generic.List[object]
 
     # Verify every exclusion matches a real resource BEFORE writing anything. An exclusion that
     # matches nothing - a typo, a stale ID, an unsubstituted placeholder - would silently leave
@@ -2129,6 +2216,45 @@ try
         Group-Object Scope, Action |
         Sort-Object Name |
         ForEach-Object { Write-Host ("  {0,-45} {1}" -f $_.Name, $_.Count) }
+
+    if ($script:FailureReasons.Count -gt 0)
+    {
+        Write-Host ''
+        Write-Host 'WHY WRITES FAILED' -ForegroundColor Red
+        Write-Host '-----------------' -ForegroundColor Red
+
+        $script:FailureReasons |
+            Group-Object StatusCode, Detail |
+            Sort-Object Count -Descending |
+            ForEach-Object {
+                $sample = $_.Group[0]
+                $envs = ($_.Group | Select-Object -ExpandProperty EnvironmentName -Unique) -join ', '
+                Write-Host ''
+                Write-Host ("  {0} failure(s) - HTTP {1}" -f $_.Count, $sample.StatusCode) -ForegroundColor Red
+                Write-Host ("  {0}" -f $sample.Detail) -ForegroundColor Yellow
+                Write-Host ("  Environments: {0}" -f $envs) -ForegroundColor DarkGray
+            }
+
+        Write-Host ''
+        Write-Host 'Reading the status code:' -ForegroundColor Yellow
+        Write-Host '' -ForegroundColor Yellow
+        Write-Host '  400 NoAvailableCapacitySource' -ForegroundColor Yellow
+        Write-Host '      The environment has no capacity source, so there is nothing for a per-agent' -ForegroundColor Yellow
+        Write-Host '      limit to apply against. An environment can consume credits only through an' -ForegroundColor Yellow
+        Write-Host '      allocation, tenant-pool draw, or a linked pay-as-you-go billing plan.' -ForegroundColor Yellow
+        Write-Host '' -ForegroundColor Yellow
+        Write-Host '      This failure is usually GOOD NEWS. If none of those three exist, the agents in' -ForegroundColor Yellow
+        Write-Host '      that environment cannot consume credits at all - which is the outcome a limit' -ForegroundColor Yellow
+        Write-Host '      was trying to achieve. Treat it as confirmation, not as a problem to fix.' -ForegroundColor Yellow
+        Write-Host '' -ForegroundColor Yellow
+        Write-Host '      Only give the environment a capacity source if you intend it to consume. Doing' -ForegroundColor Yellow
+        Write-Host '      so to make this script succeed would be backwards: it would enable spending in' -ForegroundColor Yellow
+        Write-Host '      order to cap it.' -ForegroundColor Yellow
+        Write-Host '' -ForegroundColor Yellow
+        Write-Host '  400 (other) - the request was rejected on its merits, not on permissions.' -ForegroundColor Yellow
+        Write-Host '  403         - permissions.' -ForegroundColor Yellow
+        Write-Host '  429         - throttling. Already retried with backoff; rerun for any stragglers.' -ForegroundColor Yellow
+    }
 
     if ($script:NotInspectedEnvironments.Count -gt 0)
     {
